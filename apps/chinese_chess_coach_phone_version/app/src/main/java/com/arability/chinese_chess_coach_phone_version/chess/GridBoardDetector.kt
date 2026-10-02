@@ -18,7 +18,6 @@ import kotlin.math.sqrt
  */
 class GridBoardDetector(
     private val maxDimension: Int = 480,
-    private val cellSize: Int = 48,
     private val debugDir: java.io.File? = null
 ) : BoardDetector {
 
@@ -100,18 +99,24 @@ class GridBoardDetector(
             bl[0] * inv, bl[1] * inv
         )
 
-        // 6. 目标矩形：左上角交叉点 (0,0)，右上 (8,0)，右下 (8,9)，左下 (0,9)
-        val cw = 8 * cellSize
-        val ch = 9 * cellSize
-        val dst = floatArrayOf(0f, 0f, cw.toFloat(), 0f, cw.toFloat(), ch.toFloat(), 0f, ch.toFloat())
+        // 6. 目标：canonical 棋盘（带 MARGIN），网格最外层交点即四角。
+        val cw = BoardGeometry.BOARD_W
+        val ch = BoardGeometry.BOARD_H
+        val dst = BoardGeometry.corners
 
-        val hInv = Homography.compute(dst, src) // dst → src
+        val hInv = Homography.compute(dst, src) // canonical → src
         val warpedPixels = Homography.warp(pixels, sw, sh, cw, ch, hInv)
         val warped = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888)
         warped.setPixels(warpedPixels, 0, cw, 0, 0, cw, ch)
 
         debugLog("detect ok: horiz=${horiz.size} vert=${vert.size} top=$top bottom=$bottom left=$left right=$right")
-        return BoardInfo(corners = src, warped = warped, cellSize = cellSize)
+        return BoardInfo(
+            corners = src,
+            warped = warped,
+            cellSize = BoardGeometry.CELL,
+            originX = BoardGeometry.MARGIN,
+            originY = BoardGeometry.MARGIN
+        )
     }
 
     // ------------------------------------------------------------- 基础算子

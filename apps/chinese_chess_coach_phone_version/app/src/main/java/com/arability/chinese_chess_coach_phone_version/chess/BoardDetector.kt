@@ -13,4 +13,9 @@ interface BoardDetector {
      * @return 检测结果；未检测到棋盘时返回 null。
      */
     fun detect(bitmap: Bitmap): BoardInfo?
+
+    /**
+     * 释放定位器占用的资源。默认空实现，供需要清理的实现（如 TFLite 解释器）覆盖。
+     */
+    fun close() {}
 }

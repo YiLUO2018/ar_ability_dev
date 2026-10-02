@@ -24,7 +24,7 @@ import com.arability.chinese_chess_coach_phone_version.chess.BoardDetector
 import com.arability.chinese_chess_coach_phone_version.chess.BoardInfo
 import com.arability.chinese_chess_coach_phone_version.chess.ChessEngine
 import com.arability.chinese_chess_coach_phone_version.chess.ChessEngineFactory
-import com.arability.chinese_chess_coach_phone_version.chess.GridBoardDetector
+import com.arability.chinese_chess_coach_phone_version.chess.BoardDetectorFactory
 import com.arability.chinese_chess_coach_phone_version.chess.Move
 import com.arability.chinese_chess_coach_phone_version.chess.Piece
 import com.arability.chinese_chess_coach_phone_version.chess.PieceColor
@@ -71,7 +71,7 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         engineExecutor = Executors.newSingleThreadExecutor()
-        boardDetector = GridBoardDetector(debugDir = java.io.File(filesDir, "debug"))
+        boardDetector = BoardDetectorFactory.create(this, debugDir = java.io.File(filesDir, "debug"))
         pieceRecognizer = PieceRecognizerFactory.create(this)
         engine = ChessEngineFactory.create()
 
@@ -269,6 +269,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         engine.close()
         pieceRecognizer.close()
+        boardDetector.close()
         cameraExecutor.shutdown()
         engineExecutor.shutdown()
         Log.i(TAG, "已释放资源")
