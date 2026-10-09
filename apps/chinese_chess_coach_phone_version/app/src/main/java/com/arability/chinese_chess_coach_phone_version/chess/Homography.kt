@@ -29,6 +29,18 @@ object Homography {
     }
 
     /**
+     * 应用单应矩阵，把源点 (x, y) 映射到目标坐标。
+     *
+     * @param h 由 [compute] 求得的 3×3 矩阵（h33=1）。
+     */
+    fun transform(h: FloatArray, x: Float, y: Float): FloatArray {
+        val w = h[6] * x + h[7] * y + h[8]
+        val tx = (h[0] * x + h[1] * y + h[2]) / w
+        val ty = (h[3] * x + h[4] * y + h[5]) / w
+        return floatArrayOf(tx, ty)
+    }
+
+    /**
      * 透视校正采样：用「目标→源」的单应矩阵 [hInv] 把 src 图像映射到 dstW×dstH。
      *
      * @param src 源像素（ARGB）。

@@ -27,4 +27,15 @@ object BoardGeometry {
         (MARGIN + 8 * CELL).toFloat(), (MARGIN + 9 * CELL).toFloat(),
         MARGIN.toFloat(), (MARGIN + 9 * CELL).toFloat(),
     )
+
+    /**
+     * canonical 物理棋盘边界四角（含边框外沿，即整张 canonical 图的四角），顺序 TL, TR, BR, BL。
+     * 分割掩码给出的是「物理棋盘边」，故应 warp 到本组边界，而非 [corners]（网格交点，内缩 MARGIN）。
+     */
+    val physicalCorners: FloatArray = floatArrayOf(
+        0f, 0f,
+        BOARD_W.toFloat(), 0f,
+        BOARD_W.toFloat(), BOARD_H.toFloat(),
+        0f, BOARD_H.toFloat(),
+    )
 }

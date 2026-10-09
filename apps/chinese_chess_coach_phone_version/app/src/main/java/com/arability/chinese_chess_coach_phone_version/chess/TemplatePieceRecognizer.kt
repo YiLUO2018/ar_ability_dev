@@ -18,7 +18,7 @@ class TemplatePieceRecognizer : PieceRecognizer {
 
     private val templates: MutableMap<Piece, IntArray> = HashMap()
 
-    override fun recognize(boardInfo: BoardInfo): Array<Array<Piece?>> {
+    override fun recognize(bitmap: Bitmap, boardInfo: BoardInfo): Array<Array<Piece?>> {
         val warped = boardInfo.warped
         val w = warped.width
         val h = warped.height

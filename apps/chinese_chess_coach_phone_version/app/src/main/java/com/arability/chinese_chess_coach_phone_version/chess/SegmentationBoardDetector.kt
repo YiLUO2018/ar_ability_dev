@@ -1,0 +1,907 @@
+package com.arability.chinese_chess_coach_phone_version.chess
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.util.Log
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.round
+import kotlin.math.sqrt
+
+/** 掩码坐标系中的二维点。 */
+internal class Pt(val x: Float, val y: Float)
+
+/**
+ * 基于 EdgeSAM（ONNX Runtime）的分割定位器：整图 → 图像编码 → 中心点提示 → 掩码 → 拟合四角 → 透视校正。
+ *
+ * EdgeSAM 官方只提供 ONNX（无 TFLite），本实现用 onnxruntime-android 跑 encoder + decoder 两个 ONNX：
+ *  - encoder：输入 `image` [1,3,1024,1024] float32（NCHW，归一化 + 右下补零），输出 `image_embeddings` [1,256,64,64]。
+ *  - decoder：输入 `image_embeddings` + `point_coords` [1,N,2] + `point_labels` [1,N]（0=负/1=正），
+ *    输出 `scores` [1,C] 与 `masks` [1,C,256,256]（logits，阈值 0）。
+ *
+ * 预处理与 EdgeSAM 官方 `Sam.preprocess` 对齐：resize 长边→1024（保比例）→ 每通道 (v-mean)/std → 右下补零。
+ * 后处理：取最高分掩码 → 二值化 → 最大连通域 → 凸包 → 贪心减点到 4 顶点 → 排序 TL,TR,BR,BL →
+ * 物理棋盘边 warp 到 canonical 物理边界（[BoardGeometry.physicalCorners]）。
+ */
+class SegmentationBoardDetector(
+    private val env: OrtEnvironment,
+    private val encoder: OrtSession,
+    private val decoder: OrtSession,
+    private var promptX: Float,
+    private var promptY: Float,
+    private val debugDir: java.io.File? = null
+) : BoardDetector {
+
+    private val encoderInput: FloatBuffer =
+        ByteBuffer.allocateDirect(3 * IMG_SIZE * IMG_SIZE * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+    private var logCounter = 0
+    private var failCounter = 0
+    private var maskShapeLogged = false
+    private var prevCorners: FloatArray? = null
+    private var jumpCandidate: FloatArray? = null
+    private var jumpStreak = 0
+    private var refineLogCounter = 0
+
+    override fun detect(bitmap: Bitmap): BoardInfo? {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w == 0 || h == 0) return null
+
+        // 1. resize 长边到 IMG_SIZE（保比例），与 ResizeLongestSide 一致。
+        val scale = IMG_SIZE.toFloat() / max(w, h)
+        val newW = max(1, round(w * scale).toInt())
+        val newH = max(1, round(h * scale).toInt())
+        val resized = if (newW == w && newH == h) bitmap
+            else Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+
+        // 2. 归一化 + 右下补零 → NCHW 输入。
+        fillEncoderInput(resized, newW, newH)
+
+        // 3. encoder → image_embeddings。
+        val (embeddings, embShape) = runEncoder()
+
+        // 4. 中心点提示（归一化坐标 × resize 后尺寸 → 1024 坐标系）。
+        val px = promptX * newW
+        val py = promptY * newH
+
+        // 5. decoder → scores + masks。
+        val out = runDecoder(embeddings, embShape, floatArrayOf(px, py), floatArrayOf(1f)) ?: return null
+
+        // 6. 候选级校验（P3-a）：对每个面积合法的候选掩码提四角并逐个过校验——
+        //    先「全可见」候选（贴边=掩码被画面裁切，拒），后「外推复原」候选
+        //    （角点出画面，靠可见边线延长求交复原）；同一优先级内用时间稳定性
+        //    仲裁：取与上一帧四角平均位移最小者。棋盘不会瞬移，溢出/碎块掩码的
+        //    四角逐帧乱跳，即使面积更大也会输给稳定的真棋盘掩码。
+        val maskSize = out.maskW * out.maskH
+        val minArea = (maskSize * MIN_AREA_RATIO).toInt()
+        val maxArea = (maskSize * MAX_AREA_RATIO).toInt()
+        // 图像内容在 256 掩码画布中的边界（非方形输入时右/下是 letterbox 零填充）。
+        val contentW = newW / 4f
+        val contentH = newH / 4f
+        val areas = IntArray(out.numMasks)
+        val candIdx = ArrayList<Int>()
+        val areaBuf = ByteArray(maskSize)
+        for (i in 0 until out.numMasks) {
+            val off = i * maskSize
+            for (j in 0 until maskSize) areaBuf[j] = if (out.masks[off + j] > 0f) 1 else 0
+            val a = largestComponentArea(areaBuf, out.maskW, out.maskH)
+            areas[i] = a
+            if (a >= minArea && a <= maxArea) candIdx.add(i)
+        }
+
+        if (!maskShapeLogged) {
+            maskShapeLogged = true
+            Log.i(
+                TAG,
+                "mask shape: numMasks=${out.numMasks} ${out.maskW}x${out.maskH} " +
+                    "scores=${out.scores.joinToString { "%.3f".format(it) }} " +
+                    "areas=${areas.joinToString()}"
+            )
+        }
+
+        val sortedCands = candIdx.sortedByDescending { areas[it] }   // 面积降序 = 无历史时的优先序
+        var chosen: QuadChoice? = null
+        for (passRecon in booleanArrayOf(false, true)) {
+            val acceptables = ArrayList<QuadChoice>()
+            for (i in sortedCands) {
+                val off = i * maskSize
+                for (j in 0 until maskSize) areaBuf[j] = if (out.masks[off + j] > 0f) 1 else 0
+                val mq = extractCornersEx(areaBuf, out.maskW, out.maskH, contentW, contentH)
+                    ?: continue
+                // 掩码坐标 → 原图坐标。掩码对应 1024 输入帧，真实图像占其左上 [newW,newH]。
+                val raw = FloatArray(8)
+                for (k in 0 until 4) {
+                    val fx = mq.corners[k * 2] * (IMG_SIZE.toFloat() / out.maskW)
+                    val fy = mq.corners[k * 2 + 1] * (IMG_SIZE.toFloat() / out.maskH)
+                    raw[k * 2] = fx * (w.toFloat() / newW)
+                    raw[k * 2 + 1] = fy * (h.toFloat() / newH)
+                }
+                // 8a. 非退化校验：掩码噪声/塌缩会产出两点重合或面积趋零的「四边形」。
+                if (!isValidQuad(raw, w, h)) continue
+                if (passRecon != mq.reconstructed) continue
+                if (!mq.reconstructed && isCutOffQuad(raw, w, h)) continue
+                if (mq.reconstructed && !withinExpandedBounds(raw, w, h)) continue
+                acceptables.add(QuadChoice(raw, mq.reconstructed, mq.centroid, i))
+            }
+            if (acceptables.isNotEmpty()) {
+                val prev = prevCorners
+                chosen = if (prev == null) acceptables[0]
+                else acceptables.minByOrNull { meanCornerDisp(it.corners, prev) }
+                break
+            }
+        }
+
+        // 所有候选都被拒 → 漏检，交给 MainActivity 的锁定迟滞保持上一帧。
+        if (chosen == null) {
+            if (failCounter++ % 5 == 0) {
+                Log.i(
+                    TAG,
+                    "detect fail: no valid candidate (min=$minArea max=$maxArea) " +
+                        "areas=${areas.joinToString()} scores=${out.scores.joinToString { "%.3f".format(it) }}"
+                )
+            }
+            if (failCounter % 10 == 0) {
+                saveFailDiag(bitmap, out, sortedCands, failCounter)
+            }
+            return null
+        }
+        val rawCorners = chosen.corners
+
+        // 8b'. 时间一致性闸：已有锁定四角时，单帧「跳变四角」（面积/角点突偏）通常是掩码
+        //      偶发溢出到桌面/阴影的坏帧——直接拒绝，交给锁定迟滞保持上一帧，避免 overlay
+        //      忽大忽小再收敛。连续多帧一致的新四角 = 真实移动，放行重锁。
+        if (prevCorners != null && isQuadJump(rawCorners, prevCorners!!)) {
+            val consistent = jumpCandidate != null && !isQuadJump(rawCorners, jumpCandidate!!)
+            jumpStreak = if (consistent) jumpStreak + 1 else 1
+            jumpCandidate = rawCorners.copyOf()
+            if (jumpStreak < JUMP_ACCEPT_STREAK) {
+                if (failCounter++ % 5 == 0) {
+                    Log.i(TAG, "detect reject: quad jump (streak=$jumpStreak) corners=[${rawCorners.joinToString { it.toInt().toString() }}]")
+                }
+                return null
+            }
+            jumpStreak = 0
+            jumpCandidate = null
+            Log.i(TAG, "quad jump accepted after streak (real movement)")
+        } else {
+            jumpStreak = 0
+            jumpCandidate = null
+        }
+
+        // 8c. 提示点回灌（归一化 [0,1]）。复原态四角质心可能在画面外，改用可见掩码质心。
+        if (chosen.reconstructed && chosen.centroid != null) {
+            val cx = chosen.centroid.x * (IMG_SIZE.toFloat() / out.maskW) * (w.toFloat() / newW)
+            val cy = chosen.centroid.y * (IMG_SIZE.toFloat() / out.maskH) * (h.toFloat() / newH)
+            promptX = (cx / w).coerceIn(0.02f, 0.98f)
+            promptY = (cy / h).coerceIn(0.02f, 0.98f)
+        } else {
+            val centroidX = (rawCorners[0] + rawCorners[2] + rawCorners[4] + rawCorners[6]) / 4f
+            val centroidY = (rawCorners[1] + rawCorners[3] + rawCorners[5] + rawCorners[7]) / 4f
+            promptX = (centroidX / w).coerceIn(0.02f, 0.98f)
+            promptY = (centroidY / h).coerceIn(0.02f, 0.98f)
+        }
+
+        // 8d. 四角自适应 EMA 平滑。
+        val corners = smoothCorners(rawCorners, w, h)
+
+        if (logCounter++ % 20 == 0) {
+            Log.i(
+                TAG,
+                "corners=[${corners[0].toInt()},${corners[1].toInt()}] " +
+                    "[${corners[2].toInt()},${corners[3].toInt()}] " +
+                    "[${corners[4].toInt()},${corners[5].toInt()}] " +
+                    "[${corners[6].toInt()},${corners[7].toInt()}] " +
+                    "mask=${chosen.maskIdx} recon=${chosen.reconstructed} area=${areas[chosen.maskIdx]}"
+            )
+            saveDebugFrame(bitmap, logCounter)
+        }
+
+        // 9. 物理棋盘边 → canonical 物理边界。
+        return buildInfo(bitmap, corners)
+    }
+
+    /** 由（已平滑的）物理四角构建 [BoardInfo]：warp 到 canonical + 图像→网格单应。 */
+    private fun buildInfo(bitmap: Bitmap, corners: FloatArray): BoardInfo {
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        val hInv = Homography.compute(BoardGeometry.physicalCorners, corners)
+        val warpedPixels = Homography.warp(
+            pixels, w, h, BoardGeometry.BOARD_W, BoardGeometry.BOARD_H, hInv
+        )
+        val warped = Bitmap.createBitmap(
+            BoardGeometry.BOARD_W, BoardGeometry.BOARD_H, Bitmap.Config.ARGB_8888
+        )
+        warped.setPixels(warpedPixels, 0, BoardGeometry.BOARD_W, 0, 0, BoardGeometry.BOARD_W, BoardGeometry.BOARD_H)
+        return BoardInfo(
+            corners = corners,
+            warped = warped,
+            cellSize = BoardGeometry.CELL,
+            originX = BoardGeometry.MARGIN,
+            originY = BoardGeometry.MARGIN,
+            imageToGrid = Homography.compute(corners, BoardGeometry.physicalCorners)
+        )
+    }
+
+    /**
+     * 棋子质心反馈的四角精修入口（P0-b）：把 [QuadRefiner] 算出的精修四角经校验后
+     * 融入 EMA 状态并重建 [BoardInfo]。校验失败返回 null（调用方沿用原 info）。
+     */
+    override fun refineQuad(bitmap: Bitmap, refinedCorners: FloatArray): BoardInfo? {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (refinedCorners.size != 8 || !isValidQuad(refinedCorners, w, h)) return null
+        if (isCutOffQuad(refinedCorners, w, h)) return null
+        val prev = prevCorners
+        if (prev != null && isQuadJump(refinedCorners, prev)) return null  // 精修不许跳变
+        val smoothed = smoothCorners(refinedCorners, w, h)
+        if (refineLogCounter++ % 10 == 0) {
+            Log.i(TAG, "quad refined: [${smoothed.joinToString { it.toInt().toString() }}]")
+        }
+        return buildInfo(bitmap, smoothed)
+    }
+
+    // ------------------------------------------------------------- 推理
+
+    private fun fillEncoderInput(bitmap: Bitmap, w: Int, h: Int) {
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        val plane = IMG_SIZE * IMG_SIZE
+        // NCHW：按通道分平面写，补零区域保持 0。
+        for (y in 0 until h) {
+            val srcRow = y * w
+            val dstRow = y * IMG_SIZE
+            for (x in 0 until w) {
+                val p = pixels[srcRow + x]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                val di = dstRow + x
+                encoderInput.put(di, (r - PIXEL_MEAN[0]) / PIXEL_STD[0])
+                encoderInput.put(plane + di, (g - PIXEL_MEAN[1]) / PIXEL_STD[1])
+                encoderInput.put(2 * plane + di, (b - PIXEL_MEAN[2]) / PIXEL_STD[2])
+            }
+        }
+    }
+
+    private fun runEncoder(): Pair<FloatArray, LongArray> {
+        encoderInput.rewind()
+        val inputTensor = OnnxTensor.createTensor(
+            env, encoderInput, longArrayOf(1, 3, IMG_SIZE.toLong(), IMG_SIZE.toLong())
+        )
+        try {
+            val result = encoder.run(mapOf("image" to inputTensor))
+            try {
+                val out = result.get("image_embeddings").get() as OnnxTensor
+                val shape = out.info.shape
+                val fb = out.floatBuffer
+                val arr = FloatArray(fb.remaining())
+                fb.get(arr)
+                return Pair(arr, shape)
+            } finally {
+                result.close()
+            }
+        } finally {
+            inputTensor.close()
+        }
+    }
+
+    private fun runDecoder(
+        embeddings: FloatArray,
+        embShape: LongArray,
+        coords: FloatArray,
+        labels: FloatArray
+    ): DecoderOutput? {
+        val embTensor = OnnxTensor.createTensor(env, directBufferOf(embeddings), embShape)
+        val n = labels.size
+        val coordsTensor = OnnxTensor.createTensor(env, directBufferOf(coords), longArrayOf(1, n.toLong(), 2))
+        val labelsTensor = OnnxTensor.createTensor(env, directBufferOf(labels), longArrayOf(1, n.toLong()))
+        try {
+            val result = decoder.run(
+                mapOf(
+                    "image_embeddings" to embTensor,
+                    "point_coords" to coordsTensor,
+                    "point_labels" to labelsTensor
+                )
+            )
+            try {
+                val scoresTensor = result.get("scores").get() as OnnxTensor
+                val masksTensor = result.get("masks").get() as OnnxTensor
+                val scoresShape = scoresTensor.info.shape
+                val masksShape = masksTensor.info.shape
+                val numMasks = scoresShape[1].toInt()
+                val maskH = masksShape[2].toInt()
+                val maskW = masksShape[3].toInt()
+
+                val sfb = scoresTensor.floatBuffer
+                val scores = FloatArray(sfb.remaining())
+                sfb.get(scores)
+                val mfb = masksTensor.floatBuffer
+                val masks = FloatArray(mfb.remaining())
+                mfb.get(masks)
+                return DecoderOutput(scores, masks, numMasks, maskW, maskH)
+            } finally {
+                result.close()
+            }
+        } finally {
+            embTensor.close()
+            coordsTensor.close()
+            labelsTensor.close()
+        }
+    }
+
+    private fun directBufferOf(arr: FloatArray): FloatBuffer {
+        val bb = ByteBuffer.allocateDirect(arr.size * 4).order(ByteOrder.nativeOrder())
+        val fb = bb.asFloatBuffer()
+        fb.put(arr)
+        fb.rewind()
+        return fb
+    }
+
+    private class DecoderOutput(
+        val scores: FloatArray,
+        val masks: FloatArray,
+        val numMasks: Int,
+        val maskW: Int,
+        val maskH: Int
+    )
+
+    // ------------------------------------------------------------- 掩码后处理
+
+    /** 计算二值掩码中最大连通域（4 邻接）的面积。 */
+    private fun largestComponentArea(binary: ByteArray, w: Int, h: Int): Int {
+        val visited = BooleanArray(w * h)
+        val stack = IntArray(w * h)
+        var best = 0
+        for (start in 0 until w * h) {
+            if (binary[start] == 0.toByte() || visited[start]) continue
+            var sp = 0
+            stack[sp++] = start
+            visited[start] = true
+            var area = 0
+            while (sp > 0) {
+                val idx = stack[--sp]
+                area++
+                val x = idx % w
+                val y = idx / w
+                if (x > 0 && binary[idx - 1] == 1.toByte() && !visited[idx - 1]) {
+                    visited[idx - 1] = true; stack[sp++] = idx - 1
+                }
+                if (x < w - 1 && binary[idx + 1] == 1.toByte() && !visited[idx + 1]) {
+                    visited[idx + 1] = true; stack[sp++] = idx + 1
+                }
+                if (y > 0 && binary[idx - w] == 1.toByte() && !visited[idx - w]) {
+                    visited[idx - w] = true; stack[sp++] = idx - w
+                }
+                if (y < h - 1 && binary[idx + w] == 1.toByte() && !visited[idx + w]) {
+                    visited[idx + w] = true; stack[sp++] = idx + w
+                }
+            }
+            if (area > best) best = area
+        }
+        return best
+    }
+
+    /** 候选选择结果：四角（原图坐标）、是否外推复原、可见掩码质心（掩码坐标）、来源掩码序号。 */
+    private class QuadChoice(
+        val corners: FloatArray,
+        val reconstructed: Boolean,
+        val centroid: Pt?,
+        val maskIdx: Int
+    )
+
+    /** 两四角平均角点位移（时间稳定性仲裁用）。 */
+    private fun meanCornerDisp(q: FloatArray, ref: FloatArray): Float {
+        var s = 0f
+        for (i in 0 until 4) {
+            val dx = q[i * 2] - ref[i * 2]
+            val dy = q[i * 2 + 1] - ref[i * 2 + 1]
+            s += hypot(dx, dy)
+        }
+        return s / 4f
+    }
+
+    /** 四角贴近画面边缘（棋盘被画面裁切，且无外推复原）→ 拒。 */
+    private fun isCutOffQuad(c: FloatArray, w: Int, h: Int): Boolean =
+        (0 until 8 step 2).any { c[it] < EDGE_MARGIN || c[it] > w - EDGE_MARGIN } ||
+            (1 until 8 step 2).any { c[it] < EDGE_MARGIN || c[it] > h - EDGE_MARGIN }
+
+    /** 复原态允许角点出画面，但不许远于半幅（防外推飞出）。 */
+    private fun withinExpandedBounds(c: FloatArray, w: Int, h: Int): Boolean {
+        val xLo = -w * 0.5f
+        val xHi = w * 1.5f
+        val yLo = -h * 0.5f
+        val yHi = h * 1.5f
+        for (i in 0 until 4) {
+            if (c[i * 2] < xLo || c[i * 2] > xHi || c[i * 2 + 1] < yLo || c[i * 2 + 1] > yHi) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /**
+     * 判断新四角相对参考四角是否「跳变」：面积比超出 [JUMP_AREA_LO, JUMP_AREA_HI]
+     * 或任一角位移超过参考对角线的 [JUMP_CORNER_RATIO]。掩码偶发溢出（变大）/
+     * 塌缩（变小）都会命中；真实的连续移动逐帧差异小，不会命中。
+     */
+    private fun isQuadJump(q: FloatArray, ref: FloatArray): Boolean {
+        val ratio = quadArea(q) / quadArea(ref).coerceAtLeast(1f)
+        if (ratio !in JUMP_AREA_LO..JUMP_AREA_HI) return true
+        val diag = max(
+            hypot(ref[2] - ref[0], ref[3] - ref[1]),
+            hypot(ref[4] - ref[6], ref[5] - ref[7]),
+        )
+        for (i in 0 until 4) {
+            val d = hypot(q[i * 2] - ref[i * 2], q[i * 2 + 1] - ref[i * 2 + 1])
+            if (d > diag * JUMP_CORNER_RATIO) return true
+        }
+        return false
+    }
+
+    private fun quadArea(c: FloatArray): Float {
+        var s = 0f
+        for (i in 0 until 4) {
+            val j = (i + 1) % 4
+            s += c[i * 2] * c[j * 2 + 1] - c[j * 2] * c[i * 2 + 1]
+        }
+        return abs(s) / 2f
+    }
+
+    /**
+     * 校验四角（TL,TR,BR,BL）是否构成非退化四边形：
+     * 1) 任意两点不能过近（塌缩检测）；2) 面积不能过小（碎片/细条检测）。
+     * 若通过校验说明四角可安全用于单应变换与 EMA。
+     */
+    private fun isValidQuad(c: FloatArray, w: Int, h: Int): Boolean {
+        if (c.size != 8) return false
+        val minDist = sqrt((w * w + h * h).toFloat()) * QUAD_MIN_DIST_RATIO
+        for (i in 0 until 4) {
+            for (j in i + 1 until 4) {
+                val dx = c[i * 2] - c[j * 2]
+                val dy = c[i * 2 + 1] - c[j * 2 + 1]
+                if (sqrt(dx * dx + dy * dy) < minDist) return false
+            }
+        }
+        // 四边形面积（鞋带公式）。
+        var s = 0f
+        for (i in 0 until 4) {
+            val j = (i + 1) % 4
+            s += c[i * 2] * c[j * 2 + 1] - c[j * 2] * c[i * 2 + 1]
+        }
+        val area = abs(s) / 2f
+        return area >= (w * h) * QUAD_MIN_AREA_RATIO
+    }
+
+    /**
+     * 四角自适应 EMA 平滑：位移小→强平滑抑制抖动，位移大→快速跟随。
+     * `α = clamp(dist / (diag·EMA_FOLLOW_RATIO), EMA_ALPHA_MIN, EMA_ALPHA_MAX)`。
+     */
+    private fun smoothCorners(raw: FloatArray, w: Int, h: Int): FloatArray {
+        val prev = prevCorners
+        if (prev == null || prev.size != 8) {
+            prevCorners = raw.copyOf()
+            return raw
+        }
+        val dx = ((raw[0] + raw[2] + raw[4] + raw[6]) - (prev[0] + prev[2] + prev[4] + prev[6])) / 4f
+        val dy = ((raw[1] + raw[3] + raw[5] + raw[7]) - (prev[1] + prev[3] + prev[5] + prev[7])) / 4f
+        val dist = sqrt(dx * dx + dy * dy)
+        val diag = sqrt((w * w + h * h).toFloat())
+        val alpha = (dist / (diag * EMA_FOLLOW_RATIO)).coerceIn(EMA_ALPHA_MIN, EMA_ALPHA_MAX)
+        val out = FloatArray(8)
+        for (i in 0 until 8) out[i] = alpha * raw[i] + (1f - alpha) * prev[i]
+        prevCorners = out.copyOf()
+        return out
+    }
+
+    private fun saveDebugFrame(bitmap: Bitmap, idx: Int) {
+        val dir = debugDir ?: return
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            val file = java.io.File(dir, "seg_$idx.png")
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "保存调试帧失败", t)
+        }
+    }
+
+    /** 失败诊断落盘：失败帧 JPEG + 各带内候选掩码 PNG（外推复原离线调试用）。 */
+    private fun saveFailDiag(bitmap: Bitmap, out: DecoderOutput, cands: List<Int>, n: Int) {
+        val dir = debugDir ?: return
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            java.io.File(dir, "fail_$n.jpg").outputStream().use { fo ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fo)
+            }
+            val maskSize = out.maskW * out.maskH
+            for (i in cands) {
+                val binary = ByteArray(maskSize)
+                val off = i * maskSize
+                for (j in 0 until maskSize) binary[j] = if (out.masks[off + j] > 0f) 1 else 0
+                saveMaskPng(binary, out.maskW, out.maskH, "fail_${n}_m$i")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "保存失败诊断失败", t)
+        }
+    }
+
+    /** 把二值掩码放大 4 倍（最近邻）保存为 PNG，便于目视/离线复现诊断。 */
+    private fun saveMaskPng(binary: ByteArray, w: Int, h: Int, name: String) {
+        val dir = debugDir ?: return
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            val up = 4
+            val bmp = Bitmap.createBitmap(w * up, h * up, Bitmap.Config.ARGB_8888)
+            val px = IntArray(w * up * h * up)
+            for (y in 0 until h) {
+                for (x in 0 until w) {
+                    val c = if (binary[y * w + x] == 1.toByte()) -1 else -0x1000000
+                    for (dy in 0 until up) {
+                        for (dx in 0 until up) {
+                            px[(y * up + dy) * (w * up) + (x * up + dx)] = c
+                        }
+                    }
+                }
+            }
+            bmp.setPixels(px, 0, w * up, 0, 0, w * up, h * up)
+            java.io.FileOutputStream(java.io.File(dir, "$name.png")).use { out ->
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            bmp.recycle()
+        } catch (t: Throwable) {
+            Log.w(TAG, "保存掩码失败", t)
+        }
+    }
+
+    override fun close() {
+        try { encoder.close() } catch (t: Throwable) { Log.w(TAG, "关闭 encoder 失败", t) }
+        try { decoder.close() } catch (t: Throwable) { Log.w(TAG, "关闭 decoder 失败", t) }
+        try { env.close() } catch (t: Throwable) { Log.w(TAG, "关闭 env 失败", t) }
+    }
+
+    companion object {
+        private const val TAG = "SegmentationBoardDetector"
+        const val ENCODER_PATH = "models/edge_sam_3x_encoder.onnx"
+        const val DECODER_PATH = "models/edge_sam_3x_decoder.onnx"
+        const val IMG_SIZE = 1024
+
+        /** 最小掩码面积占比（相对掩码图），低于视为无棋盘。 */
+        private const val MIN_AREA_RATIO = 0.02f
+
+        /** 最大掩码面积占比（相对掩码图），高于视为误分割到背景/整幅画面。 */
+        private const val MAX_AREA_RATIO = 0.35f
+
+        /** 四角距画面边缘小于该像素视为棋盘被裁切（部分出画），判为漏检。 */
+        private const val EDGE_MARGIN = 8f
+
+        /** 四角任意两点最小距离（相对画面对角线），低于视为塌缩的退化四边形。 */
+        private const val QUAD_MIN_DIST_RATIO = 0.02f
+
+        /** 四边形最小面积（相对画面），低于视为碎片/细条（非棋盘）。 */
+        private const val QUAD_MIN_AREA_RATIO = 0.01f
+
+        /** 自适应 EMA：小位移（抖动）时的最小平滑系数。 */
+        private const val EMA_ALPHA_MIN = 0.15f
+
+        /** 自适应 EMA：大位移（快速移动）时的最大跟随系数。 */
+        private const val EMA_ALPHA_MAX = 0.9f
+
+        /** 质心位移达到画面对角线的该比例时 α 接近最大，实现快速跟随。 */
+        private const val EMA_FOLLOW_RATIO = 0.08f
+
+        /** 时间一致性闸：面积比超出该区间视为跳变（掩码偶发溢出/塌缩）。 */
+        private const val JUMP_AREA_LO = 0.75f
+        private const val JUMP_AREA_HI = 1.35f
+
+        /** 任一角位移超过参考对角线的该比例视为跳变。 */
+        private const val JUMP_CORNER_RATIO = 0.22f
+
+        /** 连续 N 帧一致的「跳变」四角 = 真实移动，放行重锁。 */
+        private const val JUMP_ACCEPT_STREAK = 3
+
+        /** 贴边判据（掩码坐标 px）：顶点距内容边界 ≤ 此值视为贴边（被画面裁切痕迹）。
+         *  解码器上采样掩码距内容边界有 1~3px 内缩，须宽容差（真机 fail 掩码实测内缩 2px）。 */
+        private const val BORDER_TOL = 4.0f
+
+        /** 掩码四角提取结果：四角 TL,TR,BR,BL（掩码坐标）、是否外推复原、最大连通域质心。 */
+        internal class MaskQuad(val corners: FloatArray, val reconstructed: Boolean, val centroid: Pt?)
+
+        /**
+         * 二值掩码 → 四角。先试外推复原（角点出画面：贴边段以外的可见边线延长求交），
+         * 无贴边痕迹时走凸包 + 贪心减点（全可见路径，与 P3-a 前行为一致）。
+         */
+        internal fun extractCornersEx(
+            binary: ByteArray, w: Int, h: Int, contentW: Float, contentH: Float
+        ): MaskQuad? {
+            // 1. 4 邻接连通域标记，取最大连通域。
+            val labels = IntArray(w * h) { -1 }
+            val stack = IntArray(w * h)
+            var bestLabel = -1
+            var bestArea = 0
+            var nextLabel = 0
+            for (start in 0 until w * h) {
+                if (binary[start] == 0.toByte() || labels[start] != -1) continue
+                var sp = 0
+                stack[sp++] = start
+                labels[start] = nextLabel
+                var area = 0
+                while (sp > 0) {
+                    val idx = stack[--sp]
+                    area++
+                    val x = idx % w
+                    val y = idx / w
+                    if (x > 0 && binary[idx - 1] == 1.toByte() && labels[idx - 1] == -1) {
+                        labels[idx - 1] = nextLabel; stack[sp++] = idx - 1
+                    }
+                    if (x < w - 1 && binary[idx + 1] == 1.toByte() && labels[idx + 1] == -1) {
+                        labels[idx + 1] = nextLabel; stack[sp++] = idx + 1
+                    }
+                    if (y > 0 && binary[idx - w] == 1.toByte() && labels[idx - w] == -1) {
+                        labels[idx - w] = nextLabel; stack[sp++] = idx - w
+                    }
+                    if (y < h - 1 && binary[idx + w] == 1.toByte() && labels[idx + w] == -1) {
+                        labels[idx + w] = nextLabel; stack[sp++] = idx + w
+                    }
+                }
+                if (area > bestArea) {
+                    bestArea = area
+                    bestLabel = nextLabel
+                }
+                nextLabel++
+            }
+            if (bestLabel < 0 || bestArea < w * h * MIN_AREA_RATIO) return null
+
+            // 2. 提取最大连通域边界像素 + 质心（复原态提示点用）。
+            val boundary = ArrayList<Pt>(bestArea / 2)
+            var sx = 0f
+            var sy = 0f
+            for (idx in 0 until w * h) {
+                if (labels[idx] != bestLabel) continue
+                sx += idx % w
+                sy += idx / w
+                val x = idx % w
+                val y = idx / w
+                val isBoundary = (x == 0 || labels[idx - 1] != bestLabel) ||
+                    (x == w - 1 || labels[idx + 1] != bestLabel) ||
+                    (y == 0 || labels[idx - w] != bestLabel) ||
+                    (y == h - 1 || labels[idx + w] != bestLabel)
+                if (isBoundary) boundary.add(Pt(x.toFloat(), y.toFloat()))
+            }
+            if (boundary.size < 4) return null
+            val centroid = Pt(sx / bestArea, sy / bestArea)
+
+            // 3. 凸包 → 4'. 外推复原（优先）或 4. 贪心减点 → 5. 排序 TL,TR,BR,BL。
+            val hull = convexHull(boundary)
+            if (hull.size < 4) return null
+            val rec = reconstructClipped(hull, contentW, contentH)
+            if (rec != null) return MaskQuad(rec, true, centroid)
+            val quad = reduceToQuad(hull)
+            if (quad.size != 4) return null
+            return MaskQuad(orderQuad(quad), false, centroid)
+        }
+
+        /**
+         * 角点出画面时的外推复原：凸包环中「两端点都贴内容边界」的段 = 掩码被画面裁切的
+         * 痕迹（沿边框走线），整段丢弃；只剩一端贴边的段保留（贴边端点 = 棋盘边与边框的
+         * 交点，在真实边线上）。剩余段按环序为棋盘可见边，近共线链合并（栅格阶梯毛刺）
+         * 后须恰 4 条边线，相邻边线延长求交 = 四角（允许出画面）。
+         * 覆盖 1 角出画 / 2 对角出画；整条边出画无解返回 null。全可见（无贴边顶点）返回 null。
+         */
+        internal fun reconstructClipped(hull: List<Pt>, contentW: Float, contentH: Float): FloatArray? {
+            val n = hull.size
+            if (n < 4) return null
+            val ring = simplifyRing(hull)
+            val tol = BORDER_TOL
+
+            fun onBorder(p: Pt) =
+                p.x <= tol || p.x >= contentW - 1f - tol ||
+                    p.y <= tol || p.y >= contentH - 1f - tol
+
+            val borderV = BooleanArray(ring.size) { onBorder(ring[it]) }
+            if (!borderV.any { it }) return null
+
+            fun collinear(pa: Pt, pb: Pt, c: Pt, d: Pt): Boolean {
+                val v1x = pb.x - pa.x
+                val v1y = pb.y - pa.y
+                val v2x = d.x - c.x
+                val v2y = d.y - c.y
+                val l1 = hypot(v1x, v1y)
+                val l2 = hypot(v2x, v2y)
+                if (l1 < 1e-6f || l2 < 1e-6f) return false
+                return abs((v1x * v2x + v1y * v2y) / (l1 * l2)) > 0.94f
+            }
+
+            val board = ArrayList<Pair<Pt, Pt>>()
+            for (i in ring.indices) {
+                if (!(borderV[i] && borderV[(i + 1) % ring.size])) {
+                    board.add(ring[i] to ring[(i + 1) % ring.size])
+                }
+            }
+            if (board.isEmpty()) return null
+
+            val chains = ArrayList<Pair<Pt, Pt>>()
+            for (s in board) {
+                val last = chains.lastOrNull()
+                if (last != null && collinear(last.first, last.second, s.first, s.second)) {
+                    chains[chains.size - 1] = last.first to s.second
+                } else {
+                    chains.add(s)
+                }
+            }
+            if (chains.size >= 2) {
+                val lastC = chains.last()
+                val firstC = chains.first()
+                if (collinear(lastC.first, lastC.second, firstC.first, firstC.second)) {
+                    chains[0] = lastC.first to firstC.second
+                    chains.removeAt(chains.size - 1)
+                }
+            }
+            if (chains.size != 4) return null
+
+            fun lineIntersect(s1: Pair<Pt, Pt>, s2: Pair<Pt, Pt>): Pt? {
+                val dx1 = s1.second.x - s1.first.x
+                val dy1 = s1.second.y - s1.first.y
+                val dx2 = s2.second.x - s2.first.x
+                val dy2 = s2.second.y - s2.first.y
+                val d = dx1 * dy2 - dy1 * dx2
+                if (abs(d) < 1e-9f) return null
+                val t = ((s2.first.x - s1.first.x) * dy2 - (s2.first.y - s1.first.y) * dx2) / d
+                return Pt(s1.first.x + t * dx1, s1.first.y + t * dy1)
+            }
+
+            val pts = ArrayList<Pt>(4)
+            for (i in 0 until 4) {
+                pts.add(lineIntersect(chains[i], chains[(i + 1) % 4]) ?: return null)
+            }
+            return orderQuad(pts)
+        }
+
+        /**
+         * 保轮廓简化：贪心删除到邻点弦垂距 < 2.5px 的顶点（栅格阶梯毛刺），
+         * 真角点垂距大得以保留。凸环上与 RDP 等效（PC 复刻 _simplify_ring）。
+         */
+        private fun simplifyRing(ring: List<Pt>, eps: Float = 2.5f): List<Pt> {
+            val poly = ArrayList(ring)
+            while (poly.size > 4) {
+                val n = poly.size
+                var bestIdx = -1
+                var bestCost = Float.MAX_VALUE
+                for (i in 0 until n) {
+                    val prev = poly[(i - 1 + n) % n]
+                    val cur = poly[i]
+                    val next = poly[(i + 1) % n]
+                    val cost = pointSegDistance(cur, prev, next)
+                    if (cost < bestCost) {
+                        bestCost = cost
+                        bestIdx = i
+                    }
+                }
+                if (bestIdx < 0 || bestCost >= eps) break
+                poly.removeAt(bestIdx)
+            }
+            return poly
+        }
+
+        private fun convexHull(ptsIn: List<Pt>): List<Pt> {
+            val pts = ptsIn.distinctBy { it.x * 1_000_000f + it.y }
+                .sortedWith(compareBy({ it.x }, { it.y }))
+            if (pts.size <= 3) return pts
+
+            val lower = ArrayList<Pt>()
+            for (p in pts) {
+                while (lower.size >= 2 && cross(lower[lower.size - 2], lower[lower.size - 1], p) <= 0f) {
+                    lower.removeAt(lower.size - 1)
+                }
+                lower.add(p)
+            }
+            val upper = ArrayList<Pt>()
+            for (p in pts.asReversed()) {
+                while (upper.size >= 2 && cross(upper[upper.size - 2], upper[upper.size - 1], p) <= 0f) {
+                    upper.removeAt(upper.size - 1)
+                }
+                upper.add(p)
+            }
+            lower.removeAt(lower.size - 1)
+            upper.removeAt(upper.size - 1)
+            lower.addAll(upper)
+            return lower
+        }
+
+        private fun cross(o: Pt, a: Pt, b: Pt): Float =
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+
+        private fun reduceToQuad(hull: List<Pt>): List<Pt> {
+            val poly = ArrayList(hull)
+            while (poly.size > 4) {
+                val n = poly.size
+                var bestIdx = -1
+                var bestCost = Float.MAX_VALUE
+                for (i in 0 until n) {
+                    val prev = poly[(i - 1 + n) % n]
+                    val cur = poly[i]
+                    val next = poly[(i + 1) % n]
+                    val cost = pointSegDistance(cur, prev, next)
+                    if (cost < bestCost) {
+                        bestCost = cost
+                        bestIdx = i
+                    }
+                }
+                if (bestIdx < 0) break
+                poly.removeAt(bestIdx)
+            }
+            return poly
+        }
+
+        private fun pointSegDistance(p: Pt, a: Pt, b: Pt): Float {
+            val dx = b.x - a.x
+            val dy = b.y - a.y
+            val len2 = dx * dx + dy * dy
+            if (len2 == 0f) return dist(p, a)
+            val t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2
+            val tc = t.coerceIn(0f, 1f)
+            val projX = a.x + tc * dx
+            val projY = a.y + tc * dy
+            return dist(p, Pt(projX, projY))
+        }
+
+        private fun dist(a: Pt, b: Pt): Float {
+            val dx = a.x - b.x
+            val dy = a.y - b.y
+            return sqrt(dx * dx + dy * dy)
+        }
+
+        private fun orderQuad(pts: List<Pt>): FloatArray {
+            var tl = 0; var tr = 0; var br = 0; var bl = 0
+            var minSum = Float.MAX_VALUE; var maxSum = -Float.MAX_VALUE
+            var minDiff = Float.MAX_VALUE; var maxDiff = -Float.MAX_VALUE
+            for (i in 0 until 4) {
+                val s = pts[i].x + pts[i].y
+                val d = pts[i].y - pts[i].x
+                if (s < minSum) { minSum = s; tl = i }
+                if (s > maxSum) { maxSum = s; br = i }
+                if (d < minDiff) { minDiff = d; tr = i }
+                if (d > maxDiff) { maxDiff = d; bl = i }
+            }
+            return floatArrayOf(
+                pts[tl].x, pts[tl].y,
+                pts[tr].x, pts[tr].y,
+                pts[br].x, pts[br].y,
+                pts[bl].x, pts[bl].y
+            )
+        }
+
+        /** 精修生效日志的节流计数器上限内取样间隔。 */
+        private const val REFINE_LOG_EVERY = 10
+
+        // RGB 归一化参数（与 EdgeSAM Sam.preprocess 一致）。
+        private val PIXEL_MEAN = floatArrayOf(123.675f, 116.28f, 103.53f)
+        private val PIXEL_STD = floatArrayOf(58.395f, 57.12f, 57.375f)
+
+        /** 从 assets 加载 encoder/decoder ONNX 并创建定位器；模型缺失/损坏时抛出异常，由工厂降级。 */
+        fun load(context: Context, debugDir: java.io.File? = null): SegmentationBoardDetector {
+            val env = OrtEnvironment.getEnvironment()
+            val opts = OrtSession.SessionOptions().apply {
+                val cores = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
+                setIntraOpNumThreads(cores)
+            }
+            val encoder = env.createSession(readAsset(context, ENCODER_PATH), opts)
+            val decoder = env.createSession(readAsset(context, DECODER_PATH), opts)
+            return SegmentationBoardDetector(env, encoder, decoder, 0.5f, 0.5f, debugDir)
+        }
+
+        private fun readAsset(context: Context, path: String): ByteArray =
+            context.assets.open(path).use { it.readBytes() }
+    }
+}

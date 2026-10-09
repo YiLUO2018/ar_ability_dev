@@ -115,7 +115,8 @@ class GridBoardDetector(
             warped = warped,
             cellSize = BoardGeometry.CELL,
             originX = BoardGeometry.MARGIN,
-            originY = BoardGeometry.MARGIN
+            originY = BoardGeometry.MARGIN,
+            imageToGrid = Homography.compute(src, BoardGeometry.corners)
         )
     }
 

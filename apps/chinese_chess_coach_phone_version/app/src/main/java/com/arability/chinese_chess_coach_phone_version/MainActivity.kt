@@ -24,12 +24,15 @@ import com.arability.chinese_chess_coach_phone_version.chess.BoardDetector
 import com.arability.chinese_chess_coach_phone_version.chess.BoardInfo
 import com.arability.chinese_chess_coach_phone_version.chess.ChessEngine
 import com.arability.chinese_chess_coach_phone_version.chess.ChessEngineFactory
+import com.arability.chinese_chess_coach_phone_version.chess.ChineseNotation
+import com.arability.chinese_chess_coach_phone_version.chess.FlywheelCollector
 import com.arability.chinese_chess_coach_phone_version.chess.BoardDetectorFactory
 import com.arability.chinese_chess_coach_phone_version.chess.Move
 import com.arability.chinese_chess_coach_phone_version.chess.Piece
 import com.arability.chinese_chess_coach_phone_version.chess.PieceColor
 import com.arability.chinese_chess_coach_phone_version.chess.PieceRecognizer
 import com.arability.chinese_chess_coach_phone_version.chess.PieceRecognizerFactory
+import com.arability.chinese_chess_coach_phone_version.chess.QuadRefiner
 import com.arability.chinese_chess_coach_phone_version.databinding.ActivityMainBinding
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
@@ -44,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var boardDetector: BoardDetector
     private lateinit var pieceRecognizer: PieceRecognizer
     private lateinit var engine: ChessEngine
+    private lateinit var flywheelCollector: FlywheelCollector
 
     @Volatile private var lensFacing = CameraSelector.LENS_FACING_BACK
     @Volatile private var sideToMove = PieceColor.RED
@@ -52,8 +56,15 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var latestBoardInfo: BoardInfo? = null
     @Volatile private var latestBoard: Board? = null
+    @Volatile private var latestGrid: Array<Array<Piece?>>? = null
     @Volatile private var latestMove: Move? = null
     @Volatile private var lastBoardDetected = false
+
+    private var lockMisses = 0
+    private val recentGrids = ArrayDeque<Array<Array<Piece?>>>()
+
+    /** 上一帧 YOLO 检出棋子质心（图像像素 [x,y]），用于下一帧四角反馈精修。 */
+    @Volatile private var lastCentroids: List<FloatArray> = emptyList()
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -74,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         boardDetector = BoardDetectorFactory.create(this, debugDir = java.io.File(filesDir, "debug"))
         pieceRecognizer = PieceRecognizerFactory.create(this)
         engine = ChessEngineFactory.create()
+        flywheelCollector = FlywheelCollector(java.io.File(filesDir, "flywheel"))
 
         binding.suggestButton.setOnClickListener { onSuggestClicked() }
         binding.switchCameraButton.setOnClickListener { onSwitchCameraClicked() }
@@ -145,6 +157,7 @@ class MainActivity : AppCompatActivity() {
             lensFacing = targetFacing
             latestBoardInfo = null
             latestBoard = null
+            latestGrid = null
             latestMove = null
             bindCamera(cameraProvider)
         }, ContextCompat.getMainExecutor(this))
@@ -173,8 +186,9 @@ class MainActivity : AppCompatActivity() {
                     binding.boardOverlayView.setSuggestion(latestBoardInfo, move)
                     binding.suggestButton.isEnabled = true
                     if (move != null) {
-                        Log.i(TAG, "建议走法: ${move.toNotation()}")
-                        Toast.makeText(this, "建议走法: ${move.piece.name} ${move.toNotation()}", Toast.LENGTH_SHORT).show()
+                        val notation = ChineseNotation.of(board, move)
+                        Log.i(TAG, "建议走法: $notation")
+                        Toast.makeText(this, "建议走法: $notation", Toast.LENGTH_SHORT).show()
                     } else {
                         Toast.makeText(this, "当前局面无合法走法", Toast.LENGTH_SHORT).show()
                     }
@@ -195,22 +209,54 @@ class MainActivity : AppCompatActivity() {
 
             frameCounter++
             if (frameCounter % DETECT_EVERY_N == 0) {
-                val info = boardDetector.detect(bitmap)
-                latestBoardInfo = info
-                if (info != null) {
-                    val grid = pieceRecognizer.recognize(info)
-                    latestBoard = buildBoard(grid)
+                val detected = boardDetector.detect(bitmap)
+                if (detected != null) {
+                    lockMisses = 0
+                    // P0-b：用上一帧棋子质心反馈精修本帧四角（修近端掩码溢出导致的节点整体下移）。
+                    val info: BoardInfo = if (lastCentroids.size >= 12) {
+                        val refined = QuadRefiner.refine(detected.corners, lastCentroids)
+                        if (refined != null) {
+                            boardDetector.refineQuad(bitmap, refined) ?: detected
+                        } else {
+                            detected
+                        }
+                    } else {
+                        detected
+                    }
+                    latestBoardInfo = info
+                    val grid = pieceRecognizer.recognize(bitmap, info)
+                    lastCentroids = pieceRecognizer.lastDetections().map {
+                        floatArrayOf(it.cx, it.cy)
+                    }
+                    recentGrids.addLast(grid)
+                    while (recentGrids.size > HISTORY_SIZE) recentGrids.removeFirst()
+                    val voted = voteGrid(recentGrids)
+                    latestGrid = voted
+                    val board = buildBoard(voted)
+                    latestBoard = board
+                    // 数据飞轮：难帧（低置信/非法局面/新局面）落盘，供离线标注重训。
+                    flywheelCollector.maybeCollect(bitmap, info, board, pieceRecognizer.lastDetections())
+                } else if (lockMisses < LOCK_MAX_MISSES) {
+                    // 迟滞：短暂漏检时保持上一次结果，避免闪烁。
+                    lockMisses++
                 } else {
+                    lockMisses++
+                    latestBoardInfo = null
                     latestBoard = null
+                    latestGrid = null
+                    recentGrids.clear()
+                    lastCentroids = emptyList()
                 }
-                if ((info != null) != lastBoardDetected) {
-                    lastBoardDetected = info != null
-                    Log.i(TAG, if (info != null) "检测到棋盘" else "未检测到棋盘")
+                val hasBoard = latestBoardInfo != null
+                if (hasBoard != lastBoardDetected) {
+                    lastBoardDetected = hasBoard
+                    Log.i(TAG, if (hasBoard) "检测到棋盘" else "未检测到棋盘")
                 }
             }
 
             runOnUiThread {
                 binding.boardOverlayView.setImageSize(bitmap.width, bitmap.height)
+                binding.boardOverlayView.setPieces(latestGrid)
                 binding.boardOverlayView.setSuggestion(latestBoardInfo, latestMove)
             }
         } catch (exc: Exception) {
@@ -229,6 +275,25 @@ class MainActivity : AppCompatActivity() {
         }
         board.sideToMove = sideToMove
         return board
+    }
+
+    /** 对最近若干帧识别网格逐格多数投票，稳定局面；平票时取较新一帧的结果。 */
+    private fun voteGrid(history: List<Array<Array<Piece?>>>): Array<Array<Piece?>> {
+        if (history.isEmpty()) return Array(10) { arrayOfNulls(9) }
+        if (history.size == 1) return history.first()
+        val out = Array(10) { arrayOfNulls<Piece?>(9) }
+        for (rank in 0..9) {
+            for (file in 0..8) {
+                // 从新到旧计数，LinkedHashMap 保持插入序，平票时 maxByOrNull 取首个（较新）。
+                val counts = LinkedHashMap<Piece, Int>()
+                for (g in history.asReversed()) {
+                    val p = g[rank][file] ?: continue
+                    counts[p] = (counts[p] ?: 0) + 1
+                }
+                out[rank][file] = counts.maxByOrNull { it.value }?.key
+            }
+        }
+        return out
     }
 
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
@@ -278,5 +343,11 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "ChessCoach"
         private const val DETECT_EVERY_N = 5
+
+        /** 连续漏检超过该次数（约 LOCK_MAX_MISSES × DETECT_EVERY_N 帧）才清空棋盘。 */
+        private const val LOCK_MAX_MISSES = 3
+
+        /** 局面时间投票的历史帧数。 */
+        private const val HISTORY_SIZE = 5
     }
 }

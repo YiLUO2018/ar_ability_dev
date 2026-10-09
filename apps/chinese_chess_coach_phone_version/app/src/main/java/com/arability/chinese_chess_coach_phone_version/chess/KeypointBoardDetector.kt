@@ -24,13 +24,15 @@ import java.nio.channels.FileChannel
 class KeypointBoardDetector(
     private val interpreter: Interpreter,
     private val inputSize: Int,
-    private val confidenceThreshold: Float
+    private val confidenceThreshold: Float,
+    private val debugDir: java.io.File? = null
 ) : BoardDetector {
 
     private val inputBuffer: ByteBuffer =
         ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4).order(ByteOrder.nativeOrder())
     private val output = Array(1) { FloatArray(12) }
     private val inputPixels = IntArray(inputSize * inputSize)
+    private var logCounter = 0
 
     override fun detect(bitmap: Bitmap): BoardInfo? {
         val w = bitmap.width
@@ -60,6 +62,11 @@ class KeypointBoardDetector(
             corners[i * 2 + 1] = o[i * 2 + 1] * h
         }
 
+        if (logCounter++ % 20 == 0) {
+            Log.i(TAG, "corners=[${corners[0].toInt()},${corners[1].toInt()}] [${corners[2].toInt()},${corners[3].toInt()}] [${corners[4].toInt()},${corners[5].toInt()}] [${corners[6].toInt()},${corners[7].toInt()}] conf=$avgConf")
+            saveDebugFrame(bitmap, logCounter)
+        }
+
         val pixels = IntArray(w * h)
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
 
@@ -78,8 +85,23 @@ class KeypointBoardDetector(
             warped = warped,
             cellSize = BoardGeometry.CELL,
             originX = BoardGeometry.MARGIN,
-            originY = BoardGeometry.MARGIN
+            originY = BoardGeometry.MARGIN,
+            imageToGrid = Homography.compute(corners, BoardGeometry.corners)
         )
+    }
+
+    private fun saveDebugFrame(bitmap: Bitmap, idx: Int) {
+        val dir = debugDir ?: return
+        try {
+            if (!dir.exists()) dir.mkdirs()
+            val file = java.io.File(dir, "board_$idx.png")
+            java.io.FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+            Log.i(TAG, "已保存调试帧: ${file.absolutePath}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "保存调试帧失败", t)
+        }
     }
 
     private fun fillInput(bitmap: Bitmap) {
@@ -107,7 +129,7 @@ class KeypointBoardDetector(
         const val DEFAULT_CONFIDENCE = 0.5f
 
         /** 从 assets 加载模型并创建定位器；模型缺失/损坏时抛出异常，由工厂降级处理。 */
-        fun load(context: Context): KeypointBoardDetector {
+        fun load(context: Context, debugDir: java.io.File? = null): KeypointBoardDetector {
             val fd = context.assets.openFd(DEFAULT_MODEL_PATH)
             val buffer: MappedByteBuffer = FileInputStream(fd.fileDescriptor).channel.map(
                 FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength
@@ -115,7 +137,7 @@ class KeypointBoardDetector(
             val interpreter = Interpreter(buffer)
             val shape = interpreter.getInputTensor(0).shape()  // [1, S, S, 3]
             val inputSize = shape[1]
-            return KeypointBoardDetector(interpreter, inputSize, DEFAULT_CONFIDENCE)
+            return KeypointBoardDetector(interpreter, inputSize, DEFAULT_CONFIDENCE, debugDir)
         }
     }
 }

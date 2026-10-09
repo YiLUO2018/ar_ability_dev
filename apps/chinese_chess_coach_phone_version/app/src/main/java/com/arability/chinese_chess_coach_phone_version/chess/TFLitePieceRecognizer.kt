@@ -32,8 +32,9 @@ class TFLitePieceRecognizer(
         ByteBuffer.allocateDirect(inputW * inputH * 3 * 4).order(ByteOrder.nativeOrder())
     private val output = Array(1) { Array(NUM_CLASSES) { Array(ROWS) { FloatArray(COLS) } } }
     private val inputPixels = IntArray(inputW * inputH)
+    private var logCounter = 0
 
-    override fun recognize(boardInfo: BoardInfo): Array<Array<Piece?>> {
+    override fun recognize(bitmap: Bitmap, boardInfo: BoardInfo): Array<Array<Piece?>> {
         // 规整棋盘（450×500，canonical 带 MARGIN）→ 分类器输入尺寸（0.8×）。
         val scaled = if (boardInfo.warped.width == inputW && boardInfo.warped.height == inputH) {
             boardInfo.warped
@@ -58,6 +59,16 @@ class TFLitePieceRecognizer(
                 }
                 result[rank][file] = labelToPiece(best)
             }
+        }
+        if (logCounter++ % 20 == 0) {
+            val sb = StringBuilder(ROWS * (COLS + 1))
+            for (rank in 0 until ROWS) {
+                if (rank > 0) sb.append('/')
+                for (file in 0 until COLS) {
+                    sb.append(result[rank][file]?.fenChar ?: '.')
+                }
+            }
+            Log.i(TAG, "grid=$sb")
         }
         return result
     }

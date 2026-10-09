@@ -6,8 +6,12 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
+import com.arability.chinese_chess_coach_phone_version.chess.BoardGeometry
 import com.arability.chinese_chess_coach_phone_version.chess.BoardInfo
+import com.arability.chinese_chess_coach_phone_version.chess.Homography
 import com.arability.chinese_chess_coach_phone_version.chess.Move
+import com.arability.chinese_chess_coach_phone_version.chess.Piece
+import com.arability.chinese_chess_coach_phone_version.chess.PieceColor
 import kotlin.math.max
 
 /**
@@ -40,10 +44,35 @@ class BoardOverlayView @JvmOverloads constructor(
         style = Paint.Style.FILL
     }
 
+    private val pieceFillRed = Paint().apply {
+        color = 0xFFE53935.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val pieceFillBlack = Paint().apply {
+        color = 0xFF212121.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val pieceRingPaint = Paint().apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+    }
+
+    private val pieceTextPaint = Paint().apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        isAntiAlias = true
+        typeface = android.graphics.Typeface.DEFAULT_BOLD
+    }
+
     private var boardInfo: BoardInfo? = null
     private var move: Move? = null
+    private var pieces: Array<Array<Piece?>>? = null
     private var imageWidth = 0
     private var imageHeight = 0
+    private var boardToSource: FloatArray? = null
 
     fun setImageSize(width: Int, height: Int) {
         if (imageWidth != width || imageHeight != height) {
@@ -56,6 +85,17 @@ class BoardOverlayView @JvmOverloads constructor(
     fun setSuggestion(boardInfo: BoardInfo?, move: Move?) {
         this.boardInfo = boardInfo
         this.move = move
+        boardToSource = if (boardInfo != null && boardInfo.corners.size >= 8) {
+            Homography.compute(BoardGeometry.physicalCorners, boardInfo.corners)
+        } else {
+            null
+        }
+        invalidate()
+    }
+
+    /** 设置识别出的棋子网格（[rank][file]），在每个交叉点上画红/黑中文名。 */
+    fun setPieces(grid: Array<Array<Piece?>>?) {
+        this.pieces = grid
         invalidate()
     }
 
@@ -74,30 +114,63 @@ class BoardOverlayView @JvmOverloads constructor(
             canvas.drawLine(p3[0], p3[1], p0[0], p0[1], boardPaint)
         }
 
+        drawPieces(canvas, info)
+
         val m = move ?: return
-        val from = toView(intersectionX(info, m.fromFile), intersectionY(info, m.fromRank))
-        val to = toView(intersectionX(info, m.toFile), intersectionY(info, m.toRank))
+        val fromSrc = intersection(info, m.fromFile, m.fromRank)
+        val toSrc = intersection(info, m.toFile, m.toRank)
+        val from = toView(fromSrc[0], fromSrc[1])
+        val to = toView(toSrc[0], toSrc[1])
         drawArrow(canvas, from[0], from[1], to[0], to[1])
         val r = pointPaint.textSize.coerceAtLeast(14f)
         canvas.drawCircle(from[0], from[1], r, pointPaint)
         canvas.drawCircle(to[0], to[1], r, pointPaint)
     }
 
-    /** 将棋盘交叉点映射到源图像坐标（四角双线性插值）。 */
-    private fun intersectionX(info: BoardInfo, file: Int): Float {
-        val fx = file / 8f
-        val fy = 0f
-        val topX = lerp(info.corners[0], info.corners[2], fx)
-        val bottomX = lerp(info.corners[6], info.corners[4], fx)
-        return lerp(topX, bottomX, fy)
+    /**
+     * 将棋盘交叉点 (file, rank) 映射到源图像坐标。
+     *
+     * corners 为物理棋盘四角（SegmentationBoardDetector 输出），交叉点在 canonical 图中位于
+     * (origin + file*cell, origin + rank*cell)。用单应矩阵（而非双线性插值）做精确透视映射，
+     * 避免斜拍时网格交点偏离。
+     */
+    private fun intersection(info: BoardInfo, file: Int, rank: Int): FloatArray {
+        val cx = (info.originX + file * info.cellSize).toFloat()
+        val cy = (info.originY + rank * info.cellSize).toFloat()
+        val h = boardToSource ?: Homography.compute(BoardGeometry.physicalCorners, info.corners)
+        return Homography.transform(h, cx, cy)
     }
 
-    private fun intersectionY(info: BoardInfo, rank: Int): Float {
-        val fx = 0f
-        val fy = rank / 9f
-        val topY = lerp(info.corners[1], info.corners[3], fx)
-        val bottomY = lerp(info.corners[7], info.corners[5], fx)
-        return lerp(topY, bottomY, fy)
+    /** 在每个交叉点上画棋子：红方红底、黑方黑底，白色中文名。 */
+    private fun drawPieces(canvas: Canvas, info: BoardInfo) {
+        val grid = pieces ?: return
+        val r = cellRadius(info)
+        if (r < 3f) return
+        pieceTextPaint.textSize = r * 1.5f
+        val fm = pieceTextPaint.fontMetrics
+        val textOffsetY = -(fm.ascent + fm.descent) / 2f
+        for (rank in 0..9) {
+            for (file in 0..8) {
+                val p = grid[rank][file] ?: continue
+                val src = intersection(info, file, rank)
+                val v = toView(src[0], src[1])
+                val fill = if (p.color == PieceColor.RED) pieceFillRed else pieceFillBlack
+                canvas.drawCircle(v[0], v[1], r, fill)
+                canvas.drawCircle(v[0], v[1], r, pieceRingPaint)
+                canvas.drawText(p.name, v[0], v[1] + textOffsetY, pieceTextPaint)
+            }
+        }
+    }
+
+    /** 棋盘交叉点间距（视图坐标）的一半略小，作为棋子圆的半径。 */
+    private fun cellRadius(info: BoardInfo): Float {
+        val a = intersection(info, 0, 0)
+        val b = intersection(info, 1, 0)
+        val va = toView(a[0], a[1])
+        val vb = toView(b[0], b[1])
+        val dx = vb[0] - va[0]
+        val dy = vb[1] - va[1]
+        return kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toFloat() * 0.42f
     }
 
     /** 源图像坐标 → 视图坐标（PreviewView FILL_CENTER 缩放 + 居中裁剪）。 */
@@ -143,6 +216,4 @@ class BoardOverlayView @JvmOverloads constructor(
         }
         canvas.drawPath(path, arrowPaint)
     }
-
-    private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
 }

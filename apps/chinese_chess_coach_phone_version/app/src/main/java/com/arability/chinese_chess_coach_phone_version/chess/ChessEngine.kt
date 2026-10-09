@@ -2,7 +2,7 @@ package com.arability.chinese_chess_coach_phone_version.chess
 
 /**
  * 象棋引擎接口。上层只依赖本接口，不关心具体实现。
- * 后续接入 XQWLight（NDK/JNI）时，新增实现类并切换工厂即可。
+ * 当前实现：XQWLight（Java 移植版），备选 KotlinChessEngine（纯 Kotlin 降级）。
  */
 interface ChessEngine {
     /**
