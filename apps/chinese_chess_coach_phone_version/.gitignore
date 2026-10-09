@@ -29,3 +29,15 @@ local.properties
 /screen3.png
 /screen4.png
 /screen5.png
+
+debug_frames
+
+# IDE 配置（机器相关，不入库）
+/.idea/
+
+# 工具链训练产物与大权重（不入库；里程碑权重单独放行）
+/tools/label_real/runs/
+/tools/label_real/weights/*
+!/tools/label_real/weights/yolov8n_chess_v9.pt
+/tools/label_real/yolov8n.pt
+/tools/label_real/xqw_driver/build/

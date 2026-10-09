@@ -1,7 +1,7 @@
 # 架构修订方案 — 保留棋盘定位 + YOLO 棋子识别
 
-**日期**：2026-10-02
-**状态**：方案待定（调研中，尚未实施）
+**日期**：2026-10-02（方案）；2026-10-06（实施更新）
+**状态**：已实施（YOLO-nano 自训 + ONNX 端侧部署，见 M5–M7）
 **触发原因**：后续需在画面中用 UI（箭头/高亮）向使用者说明下一步走法，而非仅文字说明。
 
 ---
@@ -14,8 +14,8 @@
 
 | 模块 | 角色 | 提供 | 处理 |
 | :-- | :-- | :-- | :-- |
-| `BoardDetector`（棋盘定位） | **几何层** | 棋盘四角 + 单应矩阵（grid↔image） | 保留并升级 |
-| `PieceRecognizer`（棋子识别） | **语义层** | 每颗棋子的类别与位置 | 换成 YOLO 检测 |
+| `BoardDetector`（棋盘定位） | **几何层** | 棋盘四角 + 单应矩阵（grid↔image） | 保留并升级（已用 `SegmentationBoardDetector`） |
+| `PieceRecognizer`（棋子识别） | **语义层** | 每颗棋子的类别与位置 | 换成 YOLO 检测（`YoloPieceDetector`，自训 yolov8n） |
 | `BoardOverlayView`（叠加渲染） | **展示层** | 画黄色外框 + 走法箭头/高亮 | 保留并升级 |
 
 > 「定位」回答**在哪**，「识别」回答**是什么**。两者互补，不冗余。
@@ -31,7 +31,7 @@
    │                                        │
    │                                        ├──► 供 UI 叠加：grid → image（画箭头/高亮）
    │                                        │
-   │                                        └──► YoloPieceRecognizer.recognize(bitmap, boardInfo)
+   │                                        └──► YoloPieceDetector.detect(bitmap, boardInfo)
    │                                                  │  YOLO 检测棋子（框 + 类别）
    │                                                  │  每个 bbox 中心 ──单应──► 最近交叉点
    │                                                  ▼
@@ -65,35 +65,37 @@
 
 `TemplatePieceRecognizer` / `TFLitePieceRecognizer` 同步改签名（忽略 bitmap 参数，作为降级实现保留）。
 
-### 3.4 新增 `YoloPieceRecognizer`
-- 加载 `yolov5n_xq_fp16.tflite`（chess-dike / VinXiangQi 权重）。
-- 预处理：letterbox 缩放到模型输入 + 归一化。
-- 推理 + 解码（YOLOv5 输出解码）+ NMS。
+### 3.4 新增 `YoloPieceDetector`（替代原 `YoloPieceRecognizer`）
+- 加载**自训 yolov8n** 导出的 ONNX（`yolov8n_chess.onnx`，14 类），**放弃 chess-dike / VinXiangQi 的 GPL-3.0 模型**。
+- 预处理：letterbox 缩放到 640×640 + 归一化。
+- 推理 + 解码（YOLOv8 输出 `[1,18,8400]` = 前 4 通道 box(xywh) + 后 14 通道类分数，无 objectness）+ NMS。
 - 每颗棋 bbox 中心 → `imageToGrid` → 就近交叉点 → 填 9×10 网格。
+- 运行时用 ONNX Runtime（`onnxruntime-android`，与棋盘定位 `SegmentationBoardDetector` 共用同一运行时）。
 
 ### 3.5 工厂
 `PieceRecognizerFactory`：优先 YOLO（模型存在且加载成功），否则降级模板匹配。
 
 ---
 
-## 4. 待敲定的风险 / 未知项
+## 4. 已敲定结论（原风险项）
 
-1. **模型契约未知**：`yolov5n_xq_fp16.tflite` 的输入尺寸、YOLOv5 输出张量布局（是否含 anchors/NMS）、类别顺序，需拿到模型或源码确认后再写解码。
-2. **实拍泛化存疑**：chess-dike 是「屏幕识别」（识别别的象棋 App 渲染画面），对「相机实拍棋盘」泛化能力未知，需真机验证，必要时用实拍数据微调。
-3. **许可**：chess-dike / VinXiangQi 相关模型与代码为 GPL-3.0，直接内嵌有传染风险，商用/闭源需评估。
+1. ~~模型契约未知~~ → **已确认**：自训 yolov8n 输出 `[1,18,8400]`（前 4 通道 box + 14 类分数），无 anchors/NMS（YOLOv8 头无 objectness），解码可完全自控。
+2. ~~实拍泛化存疑~~ → **改用自训模型**：单视频（debug_video_01）训练对同场景检测到位（mAP50=0.97、mAP50-95=0.91），但**跨场景（board_21）仍有域差**（29/38），由「端侧采集 → 自动标注 → 重训」数据飞轮逐步覆盖。
+3. ~~许可~~ → **已规避**：完全自训 + 自导出 ONNX，无 GPL-3.0 传染风险。
 4. **走法正确性依赖几何精度**：YOLO 框中心经单应映射到交叉点，若检测框偏移（倾斜视角、遮挡）会错位到相邻交叉点，需靠「就近交叉点 + 置信度 + 历史帧稳定」兜底。
 
 ---
 
-## 5. 调研结论
+## 5. 实施结论（2026-10-06）
 
-详见 `docs/调研笔记-既有象棋软件实现.md`。要点：
+> 原「调研结论」见 `docs/调研笔记-既有象棋软件实现.md`。这里记录最终落地路线。
 
-1. 存在两大范式：**屏幕识别**（chess-dike/VinXiangQi，YOLO 检测棋盘框+棋子）与**物理棋盘**（OpenCV 四角 / ArUco / 神经网络四角 + 单应 + 逐格或 YOLO）。本项目属物理棋盘范式。
-2. chess-dike 的 `yolov5n_xq_fp16.tflite` 契约（据公开资料）：输入 640×640 letterbox RGB；输出 **15 类 = 14 棋子 + 1 棋盘框**；解码 + 类别感知 NMS；用棋盘框宽/8、高/9 反推交叉点。
-3. **风险确认**：该模型为屏幕数据训练，对实拍棋盘泛化存疑，需真机验证；许可 GPL-3.0。
-4. 若泛化差，可回退到 xq-vision 的「四角检测 + 透视校正 + 逐格分类」两阶段（与我们原架构同思路，改 ONNX/自训），或 chinese-chess-helper 的 OpenCV 传统路线。
-5. 识别结果应加**走法合法性校验**（数量/将帅/上限）兜底。
+1. **范式确认**：本项目属物理棋盘范式（棋盘定位单应 + 逐子 YOLO），与屏幕识别（chess-dike）不同，直接复用其模型不成立。
+2. **模型选型**：`yolov8n`（Ultralytics），14 类中文名（红：帅/仕/相/车/马/炮/兵；黑：将/士/象/车/马/炮/卒）。
+3. **训练数据**：`tools/label_real/` M0–M5 自动标注管线产出 `m5_samples_v3.json`（5636 框 / 184 关键帧），导出 `m5_yolo_v3` Ultralytics 数据集。
+4. **训练结果**：val mAP50=0.9706、mAP50-95=0.9074（1114 实例，诚实划分）；同视频漏检已修，跨场景仍待数据飞轮。
+5. **部署**：`best.pt` → ONNX 导出 → `YoloPieceDetector.kt` + ONNX Runtime 推理。
+6. 识别结果加**走法合法性校验**（数量/将帅/上限）兜底。
 
 ---
 
