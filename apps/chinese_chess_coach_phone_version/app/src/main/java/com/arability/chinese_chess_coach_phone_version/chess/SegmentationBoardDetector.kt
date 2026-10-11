@@ -52,6 +52,9 @@ class SegmentationBoardDetector(
     private var jumpStreak = 0
     private var refineLogCounter = 0
 
+    /** 连续 detect 失败次数（成功清零）。≥阈值时触发历史失效与中心提示救援。 */
+    private var failStreak = 0
+
     /** 上一帧 YOLO 棋子质心（图像像素），无历史时候选甄别先验（C7①）。 */
     private var refCentroids: List<FloatArray> = emptyList()
 
@@ -59,6 +62,16 @@ class SegmentationBoardDetector(
         val w = bitmap.width
         val h = bitmap.height
         if (w == 0 || h == 0) return null
+
+        // 历史失效保护（移动重锁修复 A 配套，2026-10-11 移动实测教训）：连续失败 ≥2 次
+        // 说明棋盘/相机已大幅移动，prevCorners 与跳变闸基线已陈旧——清空后走「无历史」
+        // 路径（C7① 质心先验 + EMA 重新起步）。否则重锁结果会被跳变闸用陈旧基线误拒
+        // （跳变闸要连续 3 帧一致才放行，移动中每帧都「跳」，永远凑不满）。
+        if (failStreak >= HISTORY_INVALIDATE_AFTER_FAILS && prevCorners != null) {
+            prevCorners = null
+            jumpCandidate = null
+            jumpStreak = 0
+        }
 
         // 1. resize 长边到 IMG_SIZE（保比例），与 ResizeLongestSide 一致。
         val scale = IMG_SIZE.toFloat() / max(w, h)
@@ -77,14 +90,100 @@ class SegmentationBoardDetector(
         val px = promptX * newW
         val py = promptY * newH
 
-        // 5. decoder → scores + masks。
-        val out = runDecoder(embeddings, embShape, floatArrayOf(px, py), floatArrayOf(1f)) ?: return null
+        // 5. decoder → scores + masks（提示点 = 回灌质心）。
+        var out = runDecoder(embeddings, embShape, floatArrayOf(px, py), floatArrayOf(1f)) ?: return null
+        var chosen = selectCandidate(out, newW, newH, w, h, bitmap)
 
-        // 6. 候选级校验（P3-a）：对每个面积合法的候选掩码提四角并逐个过校验——
-        //    先「全可见」候选（贴边=掩码被画面裁切，拒），后「外推复原」候选
-        //    （角点出画面，靠可见边线延长求交复原）；同一优先级内用时间稳定性
-        //    仲裁：取与上一帧四角平均位移最小者。棋盘不会瞬移，溢出/碎块掩码的
-        //    四角逐帧乱跳，即使面积更大也会输给稳定的真棋盘掩码。
+        // 5b. 帧内中心提示救援（移动重锁修复 A）：连续失败说明回灌提示点已陈旧——
+        //     棋盘移走后提示点落在背景上，decoder 输出碎片噪声掩码（实测 fg 7.9% 但
+        //     最大连通域 <52px）。decoder 仅 ~240ms，候选全拒且当前非中心提示时，
+        //     用画面中心重跑一次 decoder 即可单帧自愈（PC 复刻已验证中心提示可检出）。
+        if (chosen == null && failStreak >= PROMPT_RESCUE_AFTER_FAILS &&
+            (promptX != 0.5f || promptY != 0.5f)
+        ) {
+            out = runDecoder(embeddings, embShape, floatArrayOf(newW / 2f, newH / 2f), floatArrayOf(1f)) ?: return null
+            chosen = selectCandidate(out, newW, newH, w, h, null)
+            if (chosen != null) {
+                Log.i(TAG, "center-prompt rescue ok after $failStreak fails")
+            }
+        }
+
+        // 所有候选都被拒 → 漏检，交给 MainActivity 的锁定迟滞保持上一帧。
+        if (chosen == null) {
+            failStreak++
+            if (failCounter++ % 5 == 0) {
+                Log.i(TAG, "detect fail streak=$failStreak")
+            }
+            return null
+        }
+        failStreak = 0
+
+        val rawCorners = chosen.corners
+
+        // 8b'. 时间一致性闸：已有锁定四角时，单帧「跳变四角」（面积/角点突偏）通常是掩码
+        //      偶发溢出到桌面/阴影的坏帧——直接拒绝，交给锁定迟滞保持上一帧，避免 overlay
+        //      忽大忽小再收敛。连续多帧一致的新四角 = 真实移动，放行重锁。
+        if (prevCorners != null && isQuadJump(rawCorners, prevCorners!!)) {
+            val consistent = jumpCandidate != null && !isQuadJump(rawCorners, jumpCandidate!!)
+            jumpStreak = if (consistent) jumpStreak + 1 else 1
+            jumpCandidate = rawCorners.copyOf()
+            if (jumpStreak < JUMP_ACCEPT_STREAK) {
+                if (failCounter++ % 5 == 0) {
+                    Log.i(TAG, "detect reject: quad jump (streak=$jumpStreak) corners=[${rawCorners.joinToString { it.toInt().toString() }}]")
+                }
+                return null
+            }
+            jumpStreak = 0
+            jumpCandidate = null
+            Log.i(TAG, "quad jump accepted after streak (real movement)")
+        } else {
+            jumpStreak = 0
+            jumpCandidate = null
+        }
+
+        // 8c. 提示点回灌（归一化 [0,1]）。复原态四角质心可能在画面外，改用可见掩码质心。
+        if (chosen.reconstructed && chosen.centroid != null) {
+            val cx = chosen.centroid.x * (IMG_SIZE.toFloat() / out.maskW) * (w.toFloat() / newW)
+            val cy = chosen.centroid.y * (IMG_SIZE.toFloat() / out.maskH) * (h.toFloat() / newH)
+            promptX = (cx / w).coerceIn(0.02f, 0.98f)
+            promptY = (cy / h).coerceIn(0.02f, 0.98f)
+        } else {
+            val centroidX = (rawCorners[0] + rawCorners[2] + rawCorners[4] + rawCorners[6]) / 4f
+            val centroidY = (rawCorners[1] + rawCorners[3] + rawCorners[5] + rawCorners[7]) / 4f
+            promptX = (centroidX / w).coerceIn(0.02f, 0.98f)
+            promptY = (centroidY / h).coerceIn(0.02f, 0.98f)
+        }
+
+        // 8d. 四角自适应 EMA 平滑。
+        val corners = smoothCorners(rawCorners, w, h)
+
+        if (logCounter++ % 20 == 0) {
+            Log.i(
+                TAG,
+                "corners=[${corners[0].toInt()},${corners[1].toInt()}] " +
+                    "[${corners[2].toInt()},${corners[3].toInt()}] " +
+                    "[${corners[4].toInt()},${corners[5].toInt()}] " +
+                    "[${corners[6].toInt()},${corners[7].toInt()}] " +
+                    "mask=${chosen.maskIdx} recon=${chosen.reconstructed} area=${chosen.area}"
+            )
+            saveDebugFrame(bitmap, logCounter)
+        }
+
+        // 9. 物理棋盘边 → canonical 单应（C1/C8：不再生成 warp 位图，主路径 YOLO 用原图+单应）。
+        return buildInfo(corners)
+    }
+
+    /**
+     * 候选级校验与选择（P3-a + C4/C7①，自 detect 提取以支持帧内救援重跑）：
+     * 面积带过滤 → 逐候选提四角过校验（isValidQuad/形状闸/贴边/复原域）→
+     * 先「全可见」后「外推复原」两轮 → 同优先级时间稳定性仲裁（无历史时质心先验）。
+     * 溢出/碎块掩码四角逐帧乱跳，即使面积更大也会输给稳定的真棋盘掩码。
+     *
+     * @param bitmap 非空且无候选通过时做节流日志与失败诊断落盘（救援重跑传 null 免重复）。
+     */
+    private fun selectCandidate(
+        out: DecoderOutput, newW: Int, newH: Int, w: Int, h: Int, bitmap: Bitmap?
+    ): QuadChoice? {
         val maskSize = out.maskW * out.maskH
         val minArea = (maskSize * MIN_AREA_RATIO).toInt()
         val maxArea = (maskSize * MAX_AREA_RATIO).toInt()
@@ -136,7 +235,7 @@ class SegmentationBoardDetector(
                 if (passRecon != mq.reconstructed) continue
                 if (!mq.reconstructed && isCutOffQuad(raw, w, h)) continue
                 if (mq.reconstructed && !withinExpandedBounds(raw, w, h)) continue
-                acceptables.add(QuadChoice(raw, mq.reconstructed, mq.centroid, i))
+                acceptables.add(QuadChoice(raw, mq.reconstructed, mq.centroid, i, areas[i]))
             }
             if (acceptables.isNotEmpty()) {
                 val prev = prevCorners
@@ -147,8 +246,7 @@ class SegmentationBoardDetector(
             }
         }
 
-        // 所有候选都被拒 → 漏检，交给 MainActivity 的锁定迟滞保持上一帧。
-        if (chosen == null) {
+        if (chosen == null && bitmap != null) {
             if (failCounter++ % 5 == 0) {
                 Log.i(
                     TAG,
@@ -159,61 +257,15 @@ class SegmentationBoardDetector(
             if (failCounter % 10 == 0) {
                 saveFailDiag(bitmap, out, sortedCands, failCounter)
             }
-            return null
         }
-        val rawCorners = chosen.corners
+        return chosen
+    }
 
-        // 8b'. 时间一致性闸：已有锁定四角时，单帧「跳变四角」（面积/角点突偏）通常是掩码
-        //      偶发溢出到桌面/阴影的坏帧——直接拒绝，交给锁定迟滞保持上一帧，避免 overlay
-        //      忽大忽小再收敛。连续多帧一致的新四角 = 真实移动，放行重锁。
-        if (prevCorners != null && isQuadJump(rawCorners, prevCorners!!)) {
-            val consistent = jumpCandidate != null && !isQuadJump(rawCorners, jumpCandidate!!)
-            jumpStreak = if (consistent) jumpStreak + 1 else 1
-            jumpCandidate = rawCorners.copyOf()
-            if (jumpStreak < JUMP_ACCEPT_STREAK) {
-                if (failCounter++ % 5 == 0) {
-                    Log.i(TAG, "detect reject: quad jump (streak=$jumpStreak) corners=[${rawCorners.joinToString { it.toInt().toString() }}]")
-                }
-                return null
-            }
-            jumpStreak = 0
-            jumpCandidate = null
-            Log.i(TAG, "quad jump accepted after streak (real movement)")
-        } else {
-            jumpStreak = 0
-            jumpCandidate = null
-        }
-
-        // 8c. 提示点回灌（归一化 [0,1]）。复原态四角质心可能在画面外，改用可见掩码质心。
-        if (chosen.reconstructed && chosen.centroid != null) {
-            val cx = chosen.centroid.x * (IMG_SIZE.toFloat() / out.maskW) * (w.toFloat() / newW)
-            val cy = chosen.centroid.y * (IMG_SIZE.toFloat() / out.maskH) * (h.toFloat() / newH)
-            promptX = (cx / w).coerceIn(0.02f, 0.98f)
-            promptY = (cy / h).coerceIn(0.02f, 0.98f)
-        } else {
-            val centroidX = (rawCorners[0] + rawCorners[2] + rawCorners[4] + rawCorners[6]) / 4f
-            val centroidY = (rawCorners[1] + rawCorners[3] + rawCorners[5] + rawCorners[7]) / 4f
-            promptX = (centroidX / w).coerceIn(0.02f, 0.98f)
-            promptY = (centroidY / h).coerceIn(0.02f, 0.98f)
-        }
-
-        // 8d. 四角自适应 EMA 平滑。
-        val corners = smoothCorners(rawCorners, w, h)
-
-        if (logCounter++ % 20 == 0) {
-            Log.i(
-                TAG,
-                "corners=[${corners[0].toInt()},${corners[1].toInt()}] " +
-                    "[${corners[2].toInt()},${corners[3].toInt()}] " +
-                    "[${corners[4].toInt()},${corners[5].toInt()}] " +
-                    "[${corners[6].toInt()},${corners[7].toInt()}] " +
-                    "mask=${chosen.maskIdx} recon=${chosen.reconstructed} area=${areas[chosen.maskIdx]}"
-            )
-            saveDebugFrame(bitmap, logCounter)
-        }
-
-        // 9. 物理棋盘边 → canonical 单应（C1/C8：不再生成 warp 位图，主路径 YOLO 用原图+单应）。
-        return buildInfo(corners)
+    /** 锁定丢失时清空时间跟踪状态（上层 unlock 清 UI 时调用）：下次成功走无历史路径。 */
+    override fun resetTrackingState() {
+        prevCorners = null
+        jumpCandidate = null
+        jumpStreak = 0
     }
 
     /** 由（已平滑的）物理四角构建 [BoardInfo]：仅计算图像→canonical 单应。 */
@@ -386,12 +438,13 @@ class SegmentationBoardDetector(
         return best
     }
 
-    /** 候选选择结果：四角（原图坐标）、是否外推复原、可见掩码质心（掩码坐标）、来源掩码序号。 */
+    /** 候选选择结果：四角（原图坐标）、是否外推复原、可见掩码质心（掩码坐标）、来源掩码序号、掩码面积。 */
     private class QuadChoice(
         val corners: FloatArray,
         val reconstructed: Boolean,
         val centroid: Pt?,
-        val maskIdx: Int
+        val maskIdx: Int,
+        val area: Int
     )
 
     /** 两四角平均角点位移（时间稳定性仲裁用）。 */
@@ -686,6 +739,12 @@ class SegmentationBoardDetector(
         /** 贴边判据（掩码坐标 px）：顶点距内容边界 ≤ 此值视为贴边（被画面裁切痕迹）。
          *  解码器上采样掩码距内容边界有 1~3px 内缩，须宽容差（真机 fail 掩码实测内缩 2px）。 */
         private const val BORDER_TOL = 4.0f
+
+        /** 连续失败 ≥ 此值时判定历史（prevCorners/跳变闸基线）失效，清空走无历史路径。 */
+        private const val HISTORY_INVALIDATE_AFTER_FAILS = 2
+
+        /** 连续失败 ≥ 此值后，候选全拒时启用画面中心提示救援（帧内重跑 decoder）。 */
+        private const val PROMPT_RESCUE_AFTER_FAILS = 1
 
         // ---------------- C4 形状闸 / C7① 质心先验（纯几何，JVM 可单测） ----------------
 

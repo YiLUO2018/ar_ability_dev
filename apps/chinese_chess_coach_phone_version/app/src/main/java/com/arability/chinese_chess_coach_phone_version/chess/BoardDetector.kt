@@ -33,6 +33,13 @@ interface BoardDetector {
     fun runBenchmark(bitmap: Bitmap, iters: Int, tag: String) {}
 
     /**
+     * 清空时间跟踪状态（prevCorners/EMA/跳变闸基线）。上层在「锁定丢失、清空 UI」时
+     * 调用，使下一次成功检测走「无历史」路径（C7① 质心先验仲裁 + EMA 重新起步），
+     * 避免长时间失败后用陈旧基线拖影/误拒。默认空实现。
+     */
+    fun resetTrackingState() {}
+
+    /**
      * 释放定位器占用的资源。默认空实现，供需要清理的实现（如 TFLite 解释器）覆盖。
      */
     fun close() {}

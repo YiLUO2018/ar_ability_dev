@@ -234,7 +234,10 @@ class MainActivity : AppCompatActivity() {
             }
 
             frameCounter++
-            if (frameCounter % DETECT_EVERY_N == 0) {
+            // 失败/未锁定期间加速采样（移动重锁修复 B）：每帧都检（KEEP_ONLY_LATEST 下
+            // 即背靠背全力重锁），恢复正常后回到 DETECT_EVERY_N 节拍。
+            val everyN = if (latestBoardInfo == null || lockMisses > 0) DETECT_EVERY_FAST else DETECT_EVERY_N
+            if (frameCounter % everyN == 0) {
                 val detected = boardDetector.detect(bitmap)
                 if (detected != null) {
                     lockMisses = 0
@@ -275,6 +278,9 @@ class MainActivity : AppCompatActivity() {
                     recentGrids.clear()
                     lastCentroids = emptyList()
                     boardDetector.setReferenceCentroids(emptyList())
+                    // 移动重锁修复 C：锁定丢失时同步清检测器时间状态（prevCorners/EMA 基线/
+                    // 跳变闸），下次成功走「无历史」路径（C7① 质心先验 + EMA 重新起步）。
+                    boardDetector.resetTrackingState()
                 }
                 val hasBoard = latestBoardInfo != null
                 if (hasBoard != lastBoardDetected) {
@@ -372,6 +378,9 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "ChessCoach"
         private const val DETECT_EVERY_N = 5
+
+        /** 失败/未锁定期间的检测间隔（每帧，全力重锁）。 */
+        private const val DETECT_EVERY_FAST = 1
 
         /** 连续漏检超过该次数（约 LOCK_MAX_MISSES × DETECT_EVERY_N 帧）才清空棋盘。 */
         private const val LOCK_MAX_MISSES = 3
