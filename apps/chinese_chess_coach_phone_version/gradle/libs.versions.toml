@@ -9,7 +9,6 @@ material = "1.10.0"
 constraintlayout = "2.1.4"
 activityKtx = "1.8.0"
 camerax = "1.6.0"
-tensorflowLite = "2.16.1"
 onnxruntime = "1.22.0"
 
 [libraries]
@@ -25,7 +24,6 @@ androidx-camera-core = { group = "androidx.camera", name = "camera-core", versio
 androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "camerax" }
 androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
 androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
-tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntime" }
 
 [plugins]

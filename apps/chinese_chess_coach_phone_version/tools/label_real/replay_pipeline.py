@@ -25,6 +25,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from edge_line_quad import line_intersect_quad   # C5-P1 边线求交（--quad-mode line 时启用）
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DBG = os.path.join(ROOT, "debug_frames")
 ASSETS = os.path.join(ROOT, "app", "src", "main", "assets", "models")
@@ -205,6 +207,7 @@ class EdgeSamDetector:
         return np.array([q[np.argmin(s)], q[np.argmin(d)], q[np.argmax(s)], q[np.argmax(d)]])
 
     BORDER_TOL = 4.0          # 掩码坐标系贴边判据（px）：解码器上采样掩码距内容边界有 1~3px 内缩，须宽容差
+    QUAD_MODE = "hull"        # C5-P1：全可见路径四角提取模式（hull=贪心减点线上行为；line=边线求交，失败回退 hull）
 
     @staticmethod
     def _line_intersect(la, lb):
@@ -321,6 +324,15 @@ class EdgeSamDetector:
         rec, ok = EdgeSamDetector._reconstruct_clipped(hull, cw, ch)
         if ok:
             return rec, True, comp
+        if EdgeSamDetector.QUAD_MODE == "line":
+            # C5-P1：边线求交（角点检测在简化环、边线拟合用原始边界像素云），失败回退贪心。
+            pad = np.pad(comp, 1, constant_values=False)
+            bmask = comp & ~(pad[:-2, 1:-1] & pad[2:, 1:-1] & pad[1:-1, :-2] & pad[1:-1, 2:])
+            ys, xs = np.nonzero(bmask)
+            bpts = np.stack([xs, ys], 1).astype(np.float64) if len(xs) else None
+            li = line_intersect_quad(np.asarray(hull, np.float64), bpts)
+            if li is not None:
+                return li, False, comp
         return EdgeSamDetector._greedy_quad(hull), False, comp
 
     @staticmethod
@@ -877,4 +889,5 @@ def run(video, out_dir, max_frames=0):
 if __name__ == "__main__":
     video = sys.argv[1]
     out = sys.argv[2]
+    EdgeSamDetector.QUAD_MODE = opt("--quad-mode", "hull")   # hull（默认，线上行为）| line（C5 边线求交，失败自动回退 hull）
     run(video, out, int(opt("--max", "0")))
