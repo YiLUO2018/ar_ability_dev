@@ -4,8 +4,11 @@ import android.content.Context
 import android.util.Log
 
 /**
- * 棋子识别器工厂。优先 YOLO 逐子检测（ONNX），其次 TFLite 整盘分类，最后降级模板匹配。
- * 调用方只依赖 [PieceRecognizer] 接口。
+ * 棋子识别器工厂：YOLO 逐子检测（ONNX，随 APK 内置）。
+ *
+ * 历史上的 TFLite 整盘分类 / 模板匹配兜底链已于 M1 后清理（2026-10-11，算法梳理-01 §6 C8）：
+ * 兜底仅在「内置 assets 加载失败 = 构建损坏」时触发，且其真机质量不可用——
+ * 静默降级到不可用识别器比显式报错更糟。加载失败直接抛异常，由调用方显式提示用户。
  */
 object PieceRecognizerFactory {
 
@@ -17,15 +20,7 @@ object PieceRecognizerFactory {
                 Log.i(TAG, "使用 YOLO 逐子棋子检测器（ONNX）")
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "YOLO 模型不可用，尝试 TFLite 整盘分类：${t.message}")
-            try {
-                TFLitePieceRecognizer.load(context).also {
-                    Log.i(TAG, "使用 TFLite 整盘棋子识别器")
-                }
-            } catch (t2: Throwable) {
-                Log.w(TAG, "TFLite 模型不可用，降级为模板匹配：${t2.message}")
-                TemplatePieceRecognizer()
-            }
+            throw IllegalStateException("YOLO 棋子识别模型加载失败（内置资产损坏？）：${t.message}", t)
         }
     }
 }

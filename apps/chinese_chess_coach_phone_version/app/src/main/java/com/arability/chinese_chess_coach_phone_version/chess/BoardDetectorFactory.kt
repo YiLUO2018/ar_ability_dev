@@ -4,29 +4,24 @@ import android.content.Context
 import android.util.Log
 
 /**
- * 棋盘定位器工厂。优先级：EdgeSAM 分割（[SegmentationBoardDetector]）→ 角点模型
- * （[KeypointBoardDetector]）→ 纯 Kotlin Hough（[GridBoardDetector]）。
- * 上一层加载失败时降级到下一层。调用方只依赖 [BoardDetector] 接口。
+ * 棋盘定位器工厂：EdgeSAM 分割（ONNX，随 APK 内置）。
+ *
+ * 历史上的角点模型（Keypoint，合成域差）/ Hough（Grid，斜拍失效）兜底链已于
+ * M1 后清理（2026-10-11，算法梳理-01 §6 C8）——两者均已被实证为死路。
+ * 加载失败直接抛异常，由调用方显式提示用户。
  */
 object BoardDetectorFactory {
 
     private const val TAG = "BoardDetectorFactory"
 
-    fun create(context: Context, debugDir: java.io.File? = null): BoardDetector {
-        try {
-            return SegmentationBoardDetector.load(context, debugDir).also {
-                Log.i(TAG, "使用 EdgeSAM 分割定位器")
+    /** @param useNnapi bench 模式下启用 NNAPI EP（实验，失败自动回退 CPU）。 */
+    fun create(context: Context, debugDir: java.io.File? = null, useNnapi: Boolean = false): BoardDetector {
+        return try {
+            SegmentationBoardDetector.load(context, debugDir, useNnapi).also {
+                Log.i(TAG, "使用 EdgeSAM 分割定位器（nnapi=$useNnapi）")
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "EdgeSAM 分割不可用，尝试角点模型：${t.message}")
-        }
-        try {
-            return KeypointBoardDetector.load(context, debugDir).also {
-                Log.i(TAG, "使用 TFLite 角点模型定位器")
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "TFLite 角点模型不可用，降级为 Hough 定位：${t.message}")
-            return GridBoardDetector(debugDir = debugDir)
+            throw IllegalStateException("EdgeSAM 棋盘定位模型加载失败（内置资产损坏？）：${t.message}", t)
         }
     }
 }

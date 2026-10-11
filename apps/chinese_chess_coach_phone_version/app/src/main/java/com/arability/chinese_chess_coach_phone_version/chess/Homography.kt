@@ -40,55 +40,7 @@ object Homography {
         return floatArrayOf(tx, ty)
     }
 
-    /**
-     * 透视校正采样：用「目标→源」的单应矩阵 [hInv] 把 src 图像映射到 dstW×dstH。
-     *
-     * @param src 源像素（ARGB）。
-     * @param hInv 使 dst 坐标映射回 src 坐标的单应矩阵。
-     */
-    fun warp(src: IntArray, srcW: Int, srcH: Int, dstW: Int, dstH: Int, hInv: FloatArray): IntArray {
-        val dst = IntArray(dstW * dstH)
-        for (dy in 0 until dstH) {
-            for (dx in 0 until dstW) {
-                val w = hInv[6] * dx + hInv[7] * dy + hInv[8]
-                val sx = (hInv[0] * dx + hInv[1] * dy + hInv[2]) / w
-                val sy = (hInv[3] * dx + hInv[4] * dy + hInv[5]) / w
-                dst[dy * dstW + dx] = sampleBilinear(src, srcW, srcH, sx, sy)
-            }
-        }
-        return dst
-    }
-
-    private fun sampleBilinear(src: IntArray, w: Int, h: Int, x: Float, y: Float): Int {
-        val x0 = x.toInt()
-        val y0 = y.toInt()
-        if (x0 < 0 || y0 < 0 || x0 + 1 >= w || y0 + 1 >= h) {
-            val cx = x.toInt().coerceIn(0, w - 1)
-            val cy = y.toInt().coerceIn(0, h - 1)
-            return src[cy * w + cx]
-        }
-        val fx = x - x0
-        val fy = y - y0
-        val p00 = src[y0 * w + x0]
-        val p10 = src[y0 * w + x0 + 1]
-        val p01 = src[(y0 + 1) * w + x0]
-        val p11 = src[(y0 + 1) * w + x0 + 1]
-
-        var r = 0; var g = 0; var b = 0
-        r += ((1 - fx) * (1 - fy) * ((p00 shr 16) and 0xFF)).toInt()
-        g += ((1 - fx) * (1 - fy) * ((p00 shr 8) and 0xFF)).toInt()
-        b += ((1 - fx) * (1 - fy) * (p00 and 0xFF)).toInt()
-        r += (fx * (1 - fy) * ((p10 shr 16) and 0xFF)).toInt()
-        g += (fx * (1 - fy) * ((p10 shr 8) and 0xFF)).toInt()
-        b += (fx * (1 - fy) * (p10 and 0xFF)).toInt()
-        r += ((1 - fx) * fy * ((p01 shr 16) and 0xFF)).toInt()
-        g += ((1 - fx) * fy * ((p01 shr 8) and 0xFF)).toInt()
-        b += ((1 - fx) * fy * (p01 and 0xFF)).toInt()
-        r += (fx * fy * ((p11 shr 16) and 0xFF)).toInt()
-        g += (fx * fy * ((p11 shr 8) and 0xFF)).toInt()
-        b += (fx * fy * (p11 and 0xFF)).toInt()
-        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-    }
+    // 历史 warp 位图采样（warp/sampleBilinear）已随 BoardInfo.warped 移除（2026-10-11，C1/C8）。
 
     /** 高斯消元求解 8×9 增广矩阵，结果写入 [out]（长度 8）。 */
     private fun gaussSolve(a: Array<FloatArray>, out: FloatArray) {

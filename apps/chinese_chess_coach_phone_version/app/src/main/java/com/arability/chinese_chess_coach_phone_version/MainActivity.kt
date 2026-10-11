@@ -63,6 +63,10 @@ class MainActivity : AppCompatActivity() {
     private var lockMisses = 0
     private val recentGrids = ArrayDeque<Array<Array<Piece?>>>()
 
+    /** bench 模式（C3）：`am start --ez bench true --es ep cpu|nnapi` 触发，非 null 时首帧跑一次基准。 */
+    private var benchEp: String? = null
+    private var benchDone = false
+
     /** 上一帧 YOLO 检出棋子质心（图像像素 [x,y]），用于下一帧四角反馈精修。 */
     @Volatile private var lastCentroids: List<FloatArray> = emptyList()
 
@@ -82,8 +86,24 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         engineExecutor = Executors.newSingleThreadExecutor()
-        boardDetector = BoardDetectorFactory.create(this, debugDir = java.io.File(filesDir, "debug"))
-        pieceRecognizer = PieceRecognizerFactory.create(this)
+        benchEp = if (intent.getBooleanExtra("bench", false)) intent.getStringExtra("ep") ?: "cpu" else null
+        // C8：兜底降级链已移除——模型加载失败显式报错退出，不再静默降级到不可用实现。
+        try {
+            boardDetector = BoardDetectorFactory.create(
+                this,
+                debugDir = java.io.File(filesDir, "debug"),
+                useNnapi = benchEp == "nnapi"
+            )
+            pieceRecognizer = PieceRecognizerFactory.create(this)
+        } catch (t: Throwable) {
+            Log.e(TAG, "模型加载失败", t)
+            Toast.makeText(this, "模型加载失败：${t.message}", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
+        benchEp?.let {
+            Log.i(TAG, "bench 模式：ep=$it，首帧后跑 30 次基准（看 logcat tag=BenchEP）")
+        }
         engine = ChessEngineFactory.create()
         flywheelCollector = FlywheelCollector(java.io.File(filesDir, "flywheel"))
 
@@ -207,6 +227,12 @@ class MainActivity : AppCompatActivity() {
         try {
             val bitmap = imageProxyToBitmap(imageProxy)
 
+            val ep = benchEp
+            if (ep != null && !benchDone) {
+                benchDone = true
+                boardDetector.runBenchmark(bitmap, 30, ep)
+            }
+
             frameCounter++
             if (frameCounter % DETECT_EVERY_N == 0) {
                 val detected = boardDetector.detect(bitmap)
@@ -228,6 +254,8 @@ class MainActivity : AppCompatActivity() {
                     lastCentroids = pieceRecognizer.lastDetections().map {
                         floatArrayOf(it.cx, it.cy)
                     }
+                    // C7①：质心回灌给检测器，作下一帧无历史（首帧/重锁）时候选甄别先验。
+                    boardDetector.setReferenceCentroids(lastCentroids)
                     recentGrids.addLast(grid)
                     while (recentGrids.size > HISTORY_SIZE) recentGrids.removeFirst()
                     val voted = voteGrid(recentGrids)
@@ -246,6 +274,7 @@ class MainActivity : AppCompatActivity() {
                     latestGrid = null
                     recentGrids.clear()
                     lastCentroids = emptyList()
+                    boardDetector.setReferenceCentroids(emptyList())
                 }
                 val hasBoard = latestBoardInfo != null
                 if (hasBoard != lastBoardDetected) {

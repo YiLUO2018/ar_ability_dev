@@ -10,6 +10,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.abs
+import kotlin.math.acos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.round
@@ -27,8 +28,8 @@ internal class Pt(val x: Float, val y: Float)
  *    输出 `scores` [1,C] 与 `masks` [1,C,256,256]（logits，阈值 0）。
  *
  * 预处理与 EdgeSAM 官方 `Sam.preprocess` 对齐：resize 长边→1024（保比例）→ 每通道 (v-mean)/std → 右下补零。
- * 后处理：取最高分掩码 → 二值化 → 最大连通域 → 凸包 → 贪心减点到 4 顶点 → 排序 TL,TR,BR,BL →
- * 物理棋盘边 warp 到 canonical 物理边界（[BoardGeometry.physicalCorners]）。
+ * 后处理：取面积合法的候选掩码 → 二值化 → 最大连通域 → 凸包 →（外推复原或贪心减点）四顶点 →
+ * 排序 TL,TR,BR,BL → 产出图像→canonical 单应（物理边界 [BoardGeometry.physicalCorners]）。
  */
 class SegmentationBoardDetector(
     private val env: OrtEnvironment,
@@ -50,6 +51,9 @@ class SegmentationBoardDetector(
     private var jumpCandidate: FloatArray? = null
     private var jumpStreak = 0
     private var refineLogCounter = 0
+
+    /** 上一帧 YOLO 棋子质心（图像像素），无历史时候选甄别先验（C7①）。 */
+    private var refCentroids: List<FloatArray> = emptyList()
 
     override fun detect(bitmap: Bitmap): BoardInfo? {
         val w = bitmap.width
@@ -127,6 +131,8 @@ class SegmentationBoardDetector(
                 }
                 // 8a. 非退化校验：掩码噪声/塌缩会产出两点重合或面积趋零的「四边形」。
                 if (!isValidQuad(raw, w, h)) continue
+                // 8a'. 形状闸（C4）：内角/对边比在宽松界内，杀掉溢出细条/尖菱形等「合法但非棋盘」四边形。
+                if (!hasBoardShape(raw)) continue
                 if (passRecon != mq.reconstructed) continue
                 if (!mq.reconstructed && isCutOffQuad(raw, w, h)) continue
                 if (mq.reconstructed && !withinExpandedBounds(raw, w, h)) continue
@@ -134,7 +140,8 @@ class SegmentationBoardDetector(
             }
             if (acceptables.isNotEmpty()) {
                 val prev = prevCorners
-                chosen = if (prev == null) acceptables[0]
+                // 无历史（首帧/重锁）：先试质心先验仲裁（C7①），无质心/无候选达标时回退最大面积。
+                chosen = if (prev == null) pickByCentroids(acceptables) ?: acceptables[0]
                 else acceptables.minByOrNull { meanCornerDisp(it.corners, prev) }
                 break
             }
@@ -205,27 +212,14 @@ class SegmentationBoardDetector(
             saveDebugFrame(bitmap, logCounter)
         }
 
-        // 9. 物理棋盘边 → canonical 物理边界。
-        return buildInfo(bitmap, corners)
+        // 9. 物理棋盘边 → canonical 单应（C1/C8：不再生成 warp 位图，主路径 YOLO 用原图+单应）。
+        return buildInfo(corners)
     }
 
-    /** 由（已平滑的）物理四角构建 [BoardInfo]：warp 到 canonical + 图像→网格单应。 */
-    private fun buildInfo(bitmap: Bitmap, corners: FloatArray): BoardInfo {
-        val w = bitmap.width
-        val h = bitmap.height
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        val hInv = Homography.compute(BoardGeometry.physicalCorners, corners)
-        val warpedPixels = Homography.warp(
-            pixels, w, h, BoardGeometry.BOARD_W, BoardGeometry.BOARD_H, hInv
-        )
-        val warped = Bitmap.createBitmap(
-            BoardGeometry.BOARD_W, BoardGeometry.BOARD_H, Bitmap.Config.ARGB_8888
-        )
-        warped.setPixels(warpedPixels, 0, BoardGeometry.BOARD_W, 0, 0, BoardGeometry.BOARD_W, BoardGeometry.BOARD_H)
+    /** 由（已平滑的）物理四角构建 [BoardInfo]：仅计算图像→canonical 单应。 */
+    private fun buildInfo(corners: FloatArray): BoardInfo {
         return BoardInfo(
             corners = corners,
-            warped = warped,
             cellSize = BoardGeometry.CELL,
             originX = BoardGeometry.MARGIN,
             originY = BoardGeometry.MARGIN,
@@ -248,7 +242,7 @@ class SegmentationBoardDetector(
         if (refineLogCounter++ % 10 == 0) {
             Log.i(TAG, "quad refined: [${smoothed.joinToString { it.toInt().toString() }}]")
         }
-        return buildInfo(bitmap, smoothed)
+        return buildInfo(smoothed)
     }
 
     // ------------------------------------------------------------- 推理
@@ -409,6 +403,83 @@ class SegmentationBoardDetector(
             s += hypot(dx, dy)
         }
         return s / 4f
+    }
+
+    /**
+     * 无历史时的质心先验仲裁（首帧/重锁，C7①）：在包含率 ≥[CENTROID_CONTAIN_MIN] 的候选中
+     * 取**面积最小**者——真棋盘是包住全部棋子的最紧四角；溢出候选（棋盘+桌面）同样包住但面积
+     * 更大，碎块候选包不住。无候选达标返回 null（调用方回退最大面积优先）。
+     */
+    private fun pickByCentroids(cands: List<QuadChoice>): QuadChoice? {
+        if (refCentroids.size < MIN_REF_CENTROIDS) return null
+        var best: QuadChoice? = null
+        for (c in cands) {
+            if (containmentRatio(c.corners, refCentroids) < CENTROID_CONTAIN_MIN) continue
+            if (best == null || quadAreaOf(c.corners) < quadAreaOf(best!!.corners)) best = c
+        }
+        return best
+    }
+
+    override fun setReferenceCentroids(centroids: List<FloatArray>) {
+        refCentroids = centroids
+    }
+
+    /**
+     * bench 模式（C3）：对同一帧反复测 encoder/decoder 耗时，p50/p95 打日志（tag=BenchEP）
+     * 并写 debugDir/bench_<tag>.txt。adb 触发：
+     * `am start -n .../.MainActivity --ez bench true --es ep cpu|nnapi`
+     */
+    override fun runBenchmark(bitmap: Bitmap, iters: Int, tag: String) {
+        try {
+            val w = bitmap.width
+            val h = bitmap.height
+            val scale = IMG_SIZE.toFloat() / max(w, h)
+            val newW = max(1, round(w * scale).toInt())
+            val newH = max(1, round(h * scale).toInt())
+            val resized = if (newW == w && newH == h) bitmap
+                else Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+            fillEncoderInput(resized, newW, newH)
+
+            val encTimes = LongArray(iters)
+            var embeddings = FloatArray(0)
+            var embShape = longArrayOf()
+            for (i in 0 until iters) {
+                val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+                val r = runEncoder()
+                encTimes[i] = (android.os.SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000
+                embeddings = r.first
+                embShape = r.second
+            }
+            val decTimes = LongArray(iters)
+            val prompt = floatArrayOf(newW / 2f, newH / 2f)
+            for (i in 0 until iters) {
+                val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+                runDecoder(embeddings, embShape, prompt, floatArrayOf(1f))
+                decTimes[i] = (android.os.SystemClock.elapsedRealtimeNanos() - t0) / 1_000_000
+            }
+            val report = "ep=$tag iters=$iters " +
+                "encoder_ms[p50=${percentile(encTimes, 0.50)}, p95=${percentile(encTimes, 0.95)}, " +
+                "mean=${encTimes.average().toInt()}] " +
+                "decoder_ms[p50=${percentile(decTimes, 0.50)}, p95=${percentile(decTimes, 0.95)}, " +
+                "mean=${decTimes.average().toInt()}]"
+            Log.i(BENCH_TAG, report)
+            debugDir?.let { dir ->
+                try {
+                    if (!dir.exists()) dir.mkdirs()
+                    java.io.File(dir, "bench_$tag.txt").writeText(report)
+                } catch (t: Throwable) {
+                    Log.w(BENCH_TAG, "bench 结果写文件失败", t)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(BENCH_TAG, "bench 失败", t)
+        }
+    }
+
+    private fun percentile(sorted: LongArray, q: Double): Long {
+        val s = sorted.sorted()
+        val idx = (s.size * q).toInt().coerceIn(0, s.size - 1)
+        return s[idx]
     }
 
     /** 四角贴近画面边缘（棋盘被画面裁切，且无外推复原）→ 拒。 */
@@ -573,6 +644,7 @@ class SegmentationBoardDetector(
 
     companion object {
         private const val TAG = "SegmentationBoardDetector"
+        private const val BENCH_TAG = "BenchEP"
         const val ENCODER_PATH = "models/edge_sam_3x_encoder.onnx"
         const val DECODER_PATH = "models/edge_sam_3x_decoder.onnx"
         const val IMG_SIZE = 1024
@@ -614,6 +686,82 @@ class SegmentationBoardDetector(
         /** 贴边判据（掩码坐标 px）：顶点距内容边界 ≤ 此值视为贴边（被画面裁切痕迹）。
          *  解码器上采样掩码距内容边界有 1~3px 内缩，须宽容差（真机 fail 掩码实测内缩 2px）。 */
         private const val BORDER_TOL = 4.0f
+
+        // ---------------- C4 形状闸 / C7① 质心先验（纯几何，JVM 可单测） ----------------
+
+        /** 形状闸：内角下界（度）。低于视为细条/尖菱形（非棋盘投影）。 */
+        internal const val SHAPE_MIN_ANGLE_DEG = 50f
+
+        /** 形状闸：内角上界（度）。透视下矩形投影内角可偏离 90°，但不会过远。 */
+        internal const val SHAPE_MAX_ANGLE_DEG = 130f
+
+        /** 形状闸：对边长度比界（上下边、左右边各查一次，单向比值即可双向覆盖）。 */
+        internal val SHAPE_EDGE_RATIO = 0.35f..2.9f
+
+        /** 质心先验仲裁所需的最少参考质心数（不足则视为不可靠，回退面积优先）。 */
+        internal const val MIN_REF_CENTROIDS = 10
+
+        /** 质心包含率阈值：候选至少包住该比例的参考质心才参与「最小面积」竞争。 */
+        internal const val CENTROID_CONTAIN_MIN = 0.85f
+
+        /** C4 形状闸：四角内角 ∈ [50°,130°] 且对边比在宽松界内。杀掉通过面积带/非退化校验的溢出细条。 */
+        internal fun hasBoardShape(c: FloatArray): Boolean {
+            if (c.size != 8) return false
+            for (i in 0 until 4) {
+                val p = (i + 3) % 4
+                val n = (i + 1) % 4
+                val v1x = c[p * 2] - c[i * 2]
+                val v1y = c[p * 2 + 1] - c[i * 2 + 1]
+                val v2x = c[n * 2] - c[i * 2]
+                val v2y = c[n * 2 + 1] - c[i * 2 + 1]
+                val l1 = hypot(v1x, v1y)
+                val l2 = hypot(v2x, v2y)
+                if (l1 < 1e-6f || l2 < 1e-6f) return false
+                val cosA = ((v1x * v2x + v1y * v2y) / (l1 * l2)).coerceIn(-1f, 1f)
+                val deg = acos(cosA) * (180f / Math.PI.toFloat())
+                if (deg < SHAPE_MIN_ANGLE_DEG || deg > SHAPE_MAX_ANGLE_DEG) return false
+            }
+            val top = hypot(c[2] - c[0], c[3] - c[1])
+            val bottom = hypot(c[6] - c[4], c[7] - c[5])
+            val left = hypot(c[6] - c[0], c[7] - c[1])
+            val right = hypot(c[4] - c[2], c[5] - c[3])
+            if (bottom <= 0f || right <= 0f) return false
+            if (top / bottom !in SHAPE_EDGE_RATIO) return false
+            if (left / right !in SHAPE_EDGE_RATIO) return false
+            return true
+        }
+
+        /** 点是否在凸四边形内（TL,TR,BR,BL 序，顺/逆时针均可；叉积同号判定）。 */
+        internal fun pointInQuad(q: FloatArray, x: Float, y: Float): Boolean {
+            var pos = false
+            var neg = false
+            for (i in 0 until 4) {
+                val j = (i + 1) % 4
+                val cr = (q[j * 2] - q[i * 2]) * (y - q[i * 2 + 1]) -
+                    (q[j * 2 + 1] - q[i * 2 + 1]) * (x - q[i * 2])
+                if (cr > 0f) pos = true else if (cr < 0f) neg = true
+                if (pos && neg) return false
+            }
+            return true
+        }
+
+        /** 质心包含率：落在四边形内的质心比例。 */
+        internal fun containmentRatio(q: FloatArray, cents: List<FloatArray>): Float {
+            if (cents.isEmpty()) return 0f
+            var n = 0
+            for (c in cents) if (pointInQuad(q, c[0], c[1])) n++
+            return n.toFloat() / cents.size
+        }
+
+        /** 鞋带面积（非负）。 */
+        internal fun quadAreaOf(c: FloatArray): Float {
+            var s = 0f
+            for (i in 0 until 4) {
+                val j = (i + 1) % 4
+                s += c[i * 2] * c[j * 2 + 1] - c[j * 2] * c[i * 2 + 1]
+            }
+            return abs(s) / 2f
+        }
 
         /** 掩码四角提取结果：四角 TL,TR,BR,BL（掩码坐标）、是否外推复原、最大连通域质心。 */
         internal class MaskQuad(val corners: FloatArray, val reconstructed: Boolean, val centroid: Pt?)
@@ -889,12 +1037,25 @@ class SegmentationBoardDetector(
         private val PIXEL_MEAN = floatArrayOf(123.675f, 116.28f, 103.53f)
         private val PIXEL_STD = floatArrayOf(58.395f, 57.12f, 57.375f)
 
-        /** 从 assets 加载 encoder/decoder ONNX 并创建定位器；模型缺失/损坏时抛出异常，由工厂降级。 */
-        fun load(context: Context, debugDir: java.io.File? = null): SegmentationBoardDetector {
+        /**
+         * 从 assets 加载 encoder/decoder ONNX 并创建定位器；模型缺失/损坏时抛出异常（显式失败，无降级链）。
+         *
+         * @param useNnapi 实验开关：尝试给 encoder/decoder 会话启用 NNAPI EP（bench 模式用）。
+         *                 启用失败（设备/算子不支持）自动回退纯 CPU，不影响可用性。
+         */
+        fun load(context: Context, debugDir: java.io.File? = null, useNnapi: Boolean = false): SegmentationBoardDetector {
             val env = OrtEnvironment.getEnvironment()
             val opts = OrtSession.SessionOptions().apply {
                 val cores = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
                 setIntraOpNumThreads(cores)
+                if (useNnapi) {
+                    try {
+                        addNnapi()
+                        Log.i(TAG, "NNAPI EP 已启用（算子不支持部分自动回退 CPU）")
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "NNAPI EP 启用失败，回退纯 CPU：${t.message}")
+                    }
+                }
             }
             val encoder = env.createSession(readAsset(context, ENCODER_PATH), opts)
             val decoder = env.createSession(readAsset(context, DECODER_PATH), opts)

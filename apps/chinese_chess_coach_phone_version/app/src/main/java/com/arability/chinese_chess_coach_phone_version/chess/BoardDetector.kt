@@ -8,7 +8,7 @@ import android.graphics.Bitmap
  */
 interface BoardDetector {
     /**
-     * 在图像中检测棋盘，返回棋盘四角与透视校正后的规整棋盘图。
+     * 在图像中检测棋盘，返回棋盘四角与图像→canonical 单应。
      *
      * @return 检测结果；未检测到棋盘时返回 null。
      */
@@ -19,6 +19,18 @@ interface BoardDetector {
      * 默认不支持（返回 null），调用方沿用原 [detect] 结果。
      */
     fun refineQuad(bitmap: Bitmap, refinedCorners: FloatArray): BoardInfo? = null
+
+    /**
+     * 传入上一帧检出的棋子质心（图像像素 [x,y]），作为无历史（首帧/重锁）时
+     * 候选甄别的先验（C7①：包含全部质心的最小四角 = 真棋盘）。默认空实现。
+     */
+    fun setReferenceCentroids(centroids: List<FloatArray>) {}
+
+    /**
+     * bench 模式（C3，实验）：对同一帧反复测 encoder/decoder 推理耗时，输出 p50/p95。
+     * 结果打日志并写 debugDir/bench_<tag>.txt。默认空实现。
+     */
+    fun runBenchmark(bitmap: Bitmap, iters: Int, tag: String) {}
 
     /**
      * 释放定位器占用的资源。默认空实现，供需要清理的实现（如 TFLite 解释器）覆盖。
