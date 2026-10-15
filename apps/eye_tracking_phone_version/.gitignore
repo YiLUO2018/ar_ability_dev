@@ -1,0 +1,26 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+app/build/
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# IDE 配置（机器相关，不入库）
+/.idea/
+
+# 真机调试落盘（临时帧/截图，不入库）
+debug_frames
+
+# 外部 vendor 库与缓存（不入库；依赖按需重建）
+/tools/eye_proto/pypupilext/
+__pycache__/
