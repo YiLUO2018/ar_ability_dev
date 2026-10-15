@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">gpu_on_phone</string>
+    <string name="device_info_loading">设备信息加载中…</string>
+    <string name="label_target">目标</string>
+    <string name="label_backend">后端</string>
+    <string name="hint_warmup">warmup 次数</string>
+    <string name="hint_iterations">正式测量次数</string>
+    <string name="default_warmup">5</string>
+    <string name="default_iterations">30</string>
+    <string name="btn_run">跑批</string>
+    <string name="btn_share">分享上次结果 JSON</string>
+</resources>

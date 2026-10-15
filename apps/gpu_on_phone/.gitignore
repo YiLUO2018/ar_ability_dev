@@ -1,0 +1,23 @@
+*.iml
+.gradle
+/local.properties
+/.idea/
+.kotlin/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+
+# 大模型文件不入库（基准模型经 adb/网盘分发，models/README.md 记录清单与版本）
+/models/*
+!/models/README.md
+
+# PC 侧脚本产物
+/tools/__pycache__/
+/tools/out*/
+
+# 基准结果原始落盘（结论整理进 docs 后归档可删）
+/bench_results/
+debug_frames
