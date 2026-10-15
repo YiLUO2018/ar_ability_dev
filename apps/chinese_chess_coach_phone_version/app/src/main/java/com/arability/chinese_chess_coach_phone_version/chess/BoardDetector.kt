@@ -2,6 +2,9 @@ package com.arability.chinese_chess_coach_phone_version.chess
 
 import android.graphics.Bitmap
 
+/** IMU 运动三态（IMU 静止分支：锚闸 D1 / 不清屏 D2 / 救援分级共用输入）。 */
+enum class ImuMotion { STATIC, MOVING, UNKNOWN }
+
 /**
  * 棋盘定位器接口。上层只依赖本接口，不关心具体实现。
  * 后续可替换为 OpenCV 实现，改工厂即可。
@@ -38,6 +41,26 @@ interface BoardDetector {
      * 避免长时间失败后用陈旧基线拖影/误拒。默认空实现。
      */
     fun resetTrackingState() {}
+
+    /**
+     * D1 静止锚闸（IMU 静止分支）的三态输入：STATIC 启用锚闸（相对锚漂移 >0.2 格的
+     * 候选拒绝）+ 救援仅一级（带参考）；MOVING 启用救援二级（绕参考，移动重锁）；
+     * UNKNOWN 全部不启用（传感器缺失/未定，行为退回 S7）。离开 STATIC 时实现方清锚。
+     */
+    fun onImuStateChanged(state: ImuMotion) {}
+
+    /**
+     * D1 挪盘兜底第一步（双确认超时）：静止态连续拒绝达阈值且最新被拒四角相对锚为
+     * 四角整体平移时，返回候选四角供上层内容验证（用候选跑 YOLO 查新位置棋子质心
+     * 包含率）；否则返回 null。默认 null（不支持锚闸的实现）。
+     */
+    fun reanchorCandidate(): FloatArray? = null
+
+    /**
+     * D1 挪盘兜底第二步：上层内容验证结果。accept=true → 清锚+清历史走重锁（下次
+     * 成功检测重新建锚）；false → 重置连续拒绝计数（重新攒阈值再询问）。
+     */
+    fun resolveReanchor(accept: Boolean) {}
 
     /**
      * 释放定位器占用的资源。默认空实现，供需要清理的实现（如 TFLite 解释器）覆盖。

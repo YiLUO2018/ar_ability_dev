@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from edge_line_quad import line_intersect_quad   # C5-P1 边线求交（--quad-mode line 时启用）
+from refine import refine_corners                 # C7② 网格线精修（video_01 TR 内凹根治）
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
 DBG = os.path.join(ROOT, "debug_frames")
 ASSETS = os.path.join(ROOT, "app", "src", "main", "assets", "models")
@@ -112,6 +113,29 @@ class EdgeSamDetector:
         self.prev_corners = None      # EMA 状态
         self.jump_candidate = None
         self.jump_streak = 0
+        self.fail_streak = 0          # 连续失败计数（移动重锁修复 A/B/C，与端上同）
+        # A/B 分析开关（corner_trace.py 用）：False = 修复前行为。
+        self.relock_fixes = True      # 历史失效 + 中心提示救援
+        self.shape_gate = True        # C4 形状闸
+        self.grid_refine = False      # C7② 网格线精修（默认关：P3「锁错线组」陷阱在
+        #                               video_01 复现——初始角偏 ~1 格时线匹配按最近原
+        #                               则锁错索引，rms 小但整体平移 1 格，越修越错）
+        self.GRID_RMS_MAX = 3.0       # 精修接受闸：canonical px
+        # 轨迹自省（corner_trace.py 用）
+        self._last_rescue = False
+        self._last_recon = False
+        self._last_refined = False
+        self._last_area = 0
+        # D1 静止锚（IMU 静止分支，IMU静止分支设计方案.md）。PC 模拟由 --imu 开关驱动；
+        # 真机由 StaticMotionMonitor 三态驱动（UNKNOWN/MOVING 一律不启用锚特权）。
+        self.imu_static = False
+        self.imu_moving = False       # MOVING：救援启用二级（无参考重选）；UNKNOWN=退回 S7
+        self.anchor = None            # 锚四角 (4,2)：连续一致成功检测的中位数
+        self._anchor_buf = []         # 建锚积累（贪心连续一致计数）
+        self._anchor_win = []         # 滚动锚窗口（有锚后被接受检测进窗取中位数）
+        self._anchor_rej = []         # 连续锚拒绝（双确认超时候选用）
+        self.n_anchor_rej = 0         # 累计锚拒绝次数（指标）
+        self.n_reanchor = 0           # 仲裁重锚次数（指标）
 
     # ---- 推理 ----
     def _encode(self, img):
@@ -133,6 +157,38 @@ class EdgeSamDetector:
             "image_embeddings": emb, "point_coords": coords, "point_labels": labels})
         scores, masks = out[0], out[1]        # [1,C], [1,C,256,256]
         return scores[0], masks[0]
+
+    BOX_EXPAND = 0.05       # box 提示外扩比例（相对参考 bbox 对角线）
+
+    def _box_hint(self, w, h, ref_pts=None):
+        """box 提示来源（优先级）：①静止锚 bbox——锚是经建锚验证的**固定**物理位置，
+        掩码被钉在锚附近 → 检测方差坍缩（vis5 教训：质心 bbox 会随棋子移动/遮挡期
+        崩塌 <10 个而消失/漂移，中心点提示掩码游走 195px，0.2 格锚闸被逼成永久拒绝）。
+        冻结锚非 S4 自强化：S4 的坑是 box 逐帧追掩码输出（EMA/prev），锚不追。
+        ②参考质心 bbox（移动态）。③无（纯点提示）。均外扩 5% 对角线≈物理边。"""
+        if self.imu_static and self.anchor is not None:
+            src = self.anchor
+        elif ref_pts is not None and len(ref_pts) >= self.MIN_REF_PTS:
+            src = np.asarray(ref_pts, np.float64)
+        else:
+            return None
+        x0, y0 = src[:, 0].min(), src[:, 1].min()
+        x1, y1 = src[:, 0].max(), src[:, 1].max()
+        expand = self.BOX_EXPAND * np.hypot(x1 - x0, y1 - y0)
+        return (x0 - expand, y0 - expand, x1 + expand, y1 + expand)
+
+    def _decode_box(self, emb, box, px, py, w, h):
+        """box+点混合提示（labels [2,3,1]）：box 约束物体范围，点定位板心。
+        实测（video_01）：暗对暗物理边使点提示掩码「改跟」内部高对比线（TR 内凹
+        40-150px），box 提示把问题帧 TR 压到 7-26px。坐标转 1024 系（×长边比例）。"""
+        s = 1024.0 / max(w, h)
+        coords = np.array([[[box[0] * s, box[1] * s],
+                            [box[2] * s, box[3] * s],
+                            [px, py]]], np.float32)
+        labels = np.array([[2, 3, 1]], np.float32)
+        out = self.dec.run(None, {
+            "image_embeddings": emb, "point_coords": coords, "point_labels": labels})
+        return out[0][0], out[1][0]
 
     # ---- 掩码后处理（连通域/凸包/贪心减点，Kotlin 同构）----
     @staticmethod
@@ -386,12 +442,185 @@ class EdgeSamDetector:
         self.prev_corners = out.copy()
         return out
 
-    # ---- 主检测 ----
-    def detect(self, img):
-        h, w = img.shape[:2]
-        emb, nw, nh, scale = self._encode(img)
-        px, py = self.prompt_x * nw, self.prompt_y * nh
-        scores, masks = self._decode(emb, px, py)
+    SHAPE_MIN_ANGLE, SHAPE_MAX_ANGLE = 50.0, 130.0    # C4 形状闸（与端上同构）
+    SHAPE_EDGE_LO, SHAPE_EDGE_HI = 0.35, 2.9
+
+    @staticmethod
+    def _has_board_shape(c):
+        """C4：内角∈[50°,130°] 且对边比∈[0.35,2.9]，杀溢出细条/尖菱形。"""
+        for i in range(4):
+            v1, v2 = c[(i - 1) % 4] - c[i], c[(i + 1) % 4] - c[i]
+            l1, l2 = np.hypot(*v1), np.hypot(*v2)
+            if l1 < 1e-6 or l2 < 1e-6:
+                return False
+            ang = np.degrees(np.arccos(np.clip(float(v1 @ v2) / (l1 * l2), -1, 1)))
+            if not (EdgeSamDetector.SHAPE_MIN_ANGLE <= ang <= EdgeSamDetector.SHAPE_MAX_ANGLE):
+                return False
+        top, bottom = np.hypot(*(c[1] - c[0])), np.hypot(*(c[3] - c[2]))
+        left, right = np.hypot(*(c[3] - c[0])), np.hypot(*(c[2] - c[1]))
+        if bottom <= 0 or right <= 0:
+            return False
+        return (EdgeSamDetector.SHAPE_EDGE_LO <= top / bottom <= EdgeSamDetector.SHAPE_EDGE_HI and
+                EdgeSamDetector.SHAPE_EDGE_LO <= left / right <= EdgeSamDetector.SHAPE_EDGE_HI)
+
+    MIN_REF_PTS, CONTAIN_MIN = 10, 0.95   # C7①：参考点最少数量 / 包含率阈值（0.95=好候选实测下界；
+    #                                    0.85 会放过手遮挡的 TR 60-126px 中带候选）
+
+    # D1 静止锚参数（IMU静止分支设计方案.md §6，2026-10-13 收尾版）
+    ANCHOR_SETTLE = 5            # 连续成功且互偏 <JITTER 才建锚
+    ANCHOR_JITTER = 5.0          # px（S7 正常帧角点抖动中位 4px）
+    ANCHOR_ROLL = 8              # 滚动锚窗口：被接受检测进窗取中位数——跟随 SAM 慢漂
+    #                            # （box 随棋子走子呼吸 ±20-40px 分钟级，vis5/6 实测固定锚
+    #                            # 与稳态检测互斥卡死），中位数抗 ≤3 帧突变；**显示=锚**（恒定），
+    #                            # 检测的慢漂不进显示（用户标准：静止场景四角应完全一致）。
+    ANCHOR_CORNER = 0.2          # 拒绝阈：任一角 vs 锚 > 0.2 格（收紧自 0.4——好帧抖动 p95≤11px
+    #                            # ＜0.2格，门内残余清除：静止视频单角 max 125→21px、均值 err>15px 9.7%→0%）。
+    #                            # 静止态永不自动重锚（v1 六连击一致性 / v2v3 超时 30/60 均证伪——全管线长
+    #                            # 遮挡段攒满超时在漂移位重锚，vis4 实测 6 次误仲裁→幽灵帧）；恢复=IMU 离开静止
+
+    @staticmethod
+    def _point_in_quad(q, x, y):
+        """点是否在凸四边形内（叉积同号，任意方向序）。"""
+        pos = neg = False
+        for i in range(4):
+            j = (i + 1) % 4
+            cr = (q[j][0] - q[i][0]) * (y - q[i][1]) - (q[j][1] - q[i][1]) * (x - q[i][0])
+            if cr > 0:
+                pos = True
+            elif cr < 0:
+                neg = True
+            if pos and neg:
+                return False
+        return True
+
+    @classmethod
+    def _containment(cls, q, pts):
+        """参考点被四边形包含的比例。"""
+        if pts is None or len(pts) == 0:
+            return 1.0
+        return sum(cls._point_in_quad(q, p[0], p[1]) for p in pts) / len(pts)
+
+    # ---- D1 静止锚（IMU 静止分支）----
+
+    @staticmethod
+    def _min_edge_dist(q, pts):
+        """参考点到四边形四边的最小距离（px）。真棋盘最外排棋子质心距物理边
+        ≈ MARGIN=0.5 格；外扩型伪框（掩码溢到桌面）把边推出棋子外 → 最小边距
+        显著增大——这是包含门（单向，只拦内收）拦不住的外扩判别量。"""
+        q = np.asarray(q, np.float64).reshape(4, 2)
+        pts = np.asarray(pts, np.float64)
+        best = float("inf")
+        for i in range(4):
+            a, b = q[i], q[(i + 1) % 4]
+            ab = b - a
+            l2 = float(ab @ ab)
+            if l2 < 1e-9:
+                d = np.linalg.norm(pts - a, axis=1)
+            else:
+                tt = np.clip(((pts - a) @ ab) / l2, 0, 1)
+                proj = a + tt[:, None] * ab
+                d = np.linalg.norm(pts - proj, axis=1)
+            best = min(best, float(d.min()))
+        return best
+
+    @staticmethod
+    def _cell_size(c):
+        """锚四角 → 画面格宽（canonical 450×500 对角 672.7、格 50 的比例）。"""
+        return float(np.hypot(*(c[2] - c[0]))) * (CELL / np.hypot(450.0, 500.0))
+
+    # D1 挪盘兜底（双确认超时）：①连续拒绝 ≥REANCHOR_ASK 且被拒四角相对锚为四角整体
+    # 平移（每角 >REANCHOR_MOVE_CELL 格——真挪盘四角全动，手遮挡漂移只变形 1-2 角）
+    # → reanchor_candidate() 给出候选；②上层用候选跑 YOLO 做内容验证（新位置棋子质心
+    # 包含 ≥95% 且 ≥10 个）→ resolve_reanchor。三层全过才清锚重锁，否则保持。
+    REANCHOR_ASK = 60
+    REANCHOR_MOVE_CELL = 0.5
+
+    def reanchor_candidate(self):
+        """双确认①②：超时 + 几何（整体平移）。满足返回候选四角，否则 None。"""
+        if (not self.imu_static or self.anchor is None
+                or len(self._anchor_rej) < self.REANCHOR_ASK):
+            return None
+        cell = self._cell_size(self.anchor)
+        cand = self._anchor_rej[-1]
+        d = np.linalg.norm(cand - self.anchor, axis=1)
+        return cand if float(d.min()) > self.REANCHOR_MOVE_CELL * cell else None
+
+    def resolve_reanchor(self, accept):
+        """双确认③结果回写：接受 → 清锚+清历史走重锁；否决 → 重置计数继续攒。"""
+        if accept:
+            print("    [anchor] 挪盘双确认通过 → 清锚重锁", flush=True)
+            self.anchor, self._anchor_buf, self._anchor_win, self._anchor_rej = None, [], [], []
+            self.n_reanchor += 1
+            self.prev_corners = None
+            self.jump_candidate = None
+            self.jump_streak = 0
+        else:
+            self._anchor_rej = []
+
+    def set_imu_mode(self, mode):
+        """IMU 三态写入（PC 模拟开关）：static=锚闸 D1+救援仅一级；moving=救援二级
+        （无参考重选，移动重锁）；off=UNKNOWN（传感器缺失，行为退回 S7）。离开静止清锚。"""
+        if self.imu_static and mode != "static":
+            self.anchor, self._anchor_buf, self._anchor_win, self._anchor_rej = None, [], [], []
+        self.imu_static = (mode == "static")
+        self.imu_moving = (mode == "moving")
+
+    def _anchor_check(self, corners):
+        """锚闸前半（detect 内、跳变闸之前）：静止时四角不可能真移——相对锚任一角
+        漂移 >0.2 格即伪（手遮挡掩码边界跟手走），拒绝且不污染 EMA/跳变闸基线。
+        **静止态永不自动重锚**（各版本仲裁均已证伪，见类常量注释）——锚失效路径唯一：
+        IMU 离开静止（set_imu_mode 清锚）或 unlock（reset_tracking_state）。
+        返回 False = 拒绝本帧。"""
+        if self.anchor is None:
+            return True                      # 无锚：不拦（建锚在 _anchor_feed）
+        cell = self._cell_size(self.anchor)
+        d = float(np.linalg.norm(corners - self.anchor, axis=1).max())
+        if d <= self.ANCHOR_CORNER * cell:
+            self._anchor_rej = []
+            return True
+        self._anchor_rej.append(np.asarray(corners, np.float64).copy())
+        self.n_anchor_rej += 1
+        return False
+
+    def _anchor_feed(self, corners):
+        """锚闸后半（跳变闸通过后喂锚）。两阶段：
+        无锚 → 建锚：连续 SETTLE 个互偏 <JITTER → 锚 = 组中位数（窗初始化为这组）。
+        有锚 → 滚动维护：被接受检测进窗（cap ROLL），锚 = 窗中位数——跟随 SAM 慢漂
+        （box 随棋子走子呼吸），中位数抗 ≤3 帧突变；显示取锚（恒定），慢漂不进显示。"""
+        c = np.asarray(corners, np.float64).copy()
+        if self.anchor is None:
+            if self._anchor_buf:
+                m = np.median(np.array(self._anchor_buf), 0)
+                if float(np.linalg.norm(c - m, axis=1).mean()) > self.ANCHOR_JITTER:
+                    self._anchor_buf = []    # 不一致：清零重数
+            self._anchor_buf.append(c)
+            if len(self._anchor_buf) >= self.ANCHOR_SETTLE:
+                self._anchor_win = list(self._anchor_buf)
+                self.anchor = np.median(np.array(self._anchor_win), 0)
+                self._anchor_buf = []
+                print(f"    [anchor] 建锚 {np.round(self.anchor).astype(int).tolist()}", flush=True)
+            return
+        win = self._anchor_win
+        win.append(c)
+        if len(win) > self.ANCHOR_ROLL:
+            win.pop(0)
+        new = np.median(np.array(win), 0)
+        if float(np.abs(new - self.anchor).max()) > 2.0:
+            print(f"    [anchor] 滚动更新 {np.round(self.anchor).astype(int).tolist()} → "
+                  f"{np.round(new).astype(int).tolist()}", flush=True)
+        self.anchor = new
+
+    def _select(self, masks, nw, nh, w, h, ref_pts=None):
+        """候选级校验与选择（P3-a + C4 + C7①质心包含门，与端上 selectCandidate 同构）。
+
+        C7① 质心包含门（2026-10-11 video_01 诊断引入，**常态过滤**）：手遮挡使 SAM
+        掩码沿手碎裂（右半板丢失、TR 角偏 300-500px），残缺四边形能骗过面积带/非退化/
+        贴边/形状闸，且手停留期间逐帧一致、连跳变闸 3 帧一致都骗过；但残缺四边形包不住
+        右半棋盘的参考点（上帧棋子质心）→ 包含率 <0.85 直接拒 → 迟滞保持上一好角，
+        手离开后干净重锁（同时斩断「EMA 污染→仲裁偏好坏候选」的恶性循环）。
+        无历史时在达标候选中取面积最小（真棋盘=包住全部棋子的最紧四角）。
+        返回 (corners, recon, comp, area) 或 None。
+        """
         cb_w, cb_h = nw / 4.0, nh / 4.0      # 图像内容在 256 掩码画布中的边界
         mask_size = masks.shape[1] * masks.shape[2]
         lo, hi = int(mask_size * 0.02), int(mask_size * 0.35)
@@ -403,7 +632,8 @@ class EdgeSamDetector:
         cands.sort(reverse=True)                     # 面积降序 = 原优先序
         if not cands:
             return None
-        chosen = None                                # (corners, recon, comp)
+        use_ref = ref_pts is not None and len(ref_pts) >= self.MIN_REF_PTS
+        chosen = None                                # (corners, recon, comp, area)
         for pass_recon in (False, True):             # P3-a：先全可见候选，后外推复原
             acceptables = []
             for a, i in cands:
@@ -415,6 +645,10 @@ class EdgeSamDetector:
                 corners = corners.astype(np.float32)
                 if not self._is_valid_quad(corners, w, h):
                     continue
+                if self.shape_gate and not self._has_board_shape(corners):
+                    continue
+                if use_ref and self._containment(corners, ref_pts) < self.CONTAIN_MIN:
+                    continue                         # C7①：残缺/溢出候选包不住参考点，拒
                 if pass_recon != recon:
                     continue
                 if not recon and self._is_cut_off(corners, w, h):
@@ -422,10 +656,17 @@ class EdgeSamDetector:
                 if recon and (corners[:, 0].min() < -w * 0.5 or corners[:, 0].max() > w * 1.5 or
                               corners[:, 1].min() < -h * 0.5 or corners[:, 1].max() > h * 1.5):
                     continue                         # 复原：允许出画面，但不许远于半幅
-                acceptables.append((corners, recon, comp))
+                acceptables.append((corners, recon, comp, a))
             if acceptables:
                 if self.prev_corners is None:
-                    chosen = acceptables[0]          # 无历史：面积序第一（原行为）
+                    if use_ref:
+                        # C7①：先包含率降序（外扩型 cont=1.0 但面积大不占优），再面积升序
+                        # （残缺型面积小但 cont<0.85 已被门拒）——同时治溢出与内缩。
+                        chosen = min(acceptables,
+                                     key=lambda c: (-self._containment(c[0], ref_pts),
+                                                    self._quad_area(c[0])))
+                    else:
+                        chosen = acceptables[0]      # 无历史无参考：面积序第一（原行为）
                 else:
                     # P3-a 时间稳定性仲裁：棋盘不瞬移，取与上一帧四角平均位移最小者。
                     # 溢出/碎块掩码四角逐帧乱跳，即使面积更大也会输给稳定真棋盘。
@@ -433,9 +674,96 @@ class EdgeSamDetector:
                     chosen = min(acceptables,
                                  key=lambda c: float(np.hypot(*(c[0] - ref).T).mean()))
                 break
+        return chosen
+
+    def reset_tracking_state(self):
+        """C：锁定丢失时清时间状态（与端上同）。"""
+        self.prev_corners = None
+        self.jump_candidate = None
+        self.jump_streak = 0
+
+    # ---- 主检测 ----
+    def detect(self, img, ref_pts=None):
+        """@param ref_pts 上帧参考点（棋子质心，图像坐标）——C7① 质心包含门用。"""
+        h, w = img.shape[:2]
+        # 历史失效保护（2026-10-11 v2，video_01 教训修订）：仅在有**移动证据**时清历史——
+        # ① 兜底：连续失败 ≥5（真移动长丢失）；② 救援成功时（提示点陈旧=板已移走）。
+        # 手遮挡场景（video_01）保持 prev：恢复帧由时间仲裁+跳变闸正常衔接，且 C7①
+        # 包含门会拒掉残缺候选——此前「失败≥2 就清」在遮挡场景误清历史，导致恢复帧
+        # 走无历史路径直接采纳坏候选，放大角点跳变。
+        if self.fail_streak >= 5 and self.prev_corners is not None and self.relock_fixes:
+            self.prev_corners = None
+            self.jump_candidate = None
+            self.jump_streak = 0
+        emb, nw, nh, scale = self._encode(img)
+        px, py = self.prompt_x * nw, self.prompt_y * nh
+        # C7③ box 提示：有参考点（棋子质心/节点，物理位置）时用 box+点混合提示——
+        # 暗对暗物理边场景点提示掩码会「改跟」内部高对比线（video_01 TR 内凹根因），
+        # box 直接约束物体范围。box 来源必须是物理参考（prev 四角会自我强化下陷）。
+        box = self._box_hint(w, h, ref_pts) if self.relock_fixes else None
+        if box is not None:
+            scores, masks = self._decode_box(emb, box, px, py, w, h)
+        else:
+            scores, masks = self._decode(emb, px, py)
+        chosen = self._select(masks, nw, nh, w, h, ref_pts)
+        self._last_rescue = False
+        # 帧内中心提示救援（移动重锁修复 A）：连续失败说明回灌提示点已陈旧（棋盘移走
+        # → decoder 输出碎片噪声）。候选全拒且非中心提示时，用画面中心重跑 decoder
+        # 单帧自愈；救援成功 = 移动证据，清历史（跳变闸基线已陈旧）。
+        if (chosen is None and self.fail_streak >= 1 and self.relock_fixes
+                and (self.prompt_x != 0.5 or self.prompt_y != 0.5)):
+            scores, masks = self._decode(emb, nw / 2.0, nh / 2.0)
+            # 分级救援（2026-10-12 修订 + 10-13 挪盘探针）：①带参考选（遮挡期参考
+            # 仍有效，包含门挡残缺候选）；②无参考重选仅在两种情形——imu_moving（板已
+            # 移走、参考陈旧，移动重锁）或**静止挪盘探针**（锚拒绝攒满 REANCHOR_ASK：
+            # 此时若棋盘真被挪，中心提示掩码落在新位置、旧参考包不住 → 只有绕参考才能
+            # 拿到新位置候选，它会被锚闸拒绝进入超时候选，再经双确认裁决；手遮挡段的
+            # 探针垃圾候选过不了「整体平移」几何确认，无害）。
+            chosen = self._select(masks, nw, nh, w, h, ref_pts)
+            probe = (self.imu_static and self.anchor is not None
+                     and len(self._anchor_rej) >= self.REANCHOR_ASK)
+            if chosen is None and (self.imu_moving or probe):
+                chosen = self._select(masks, nw, nh, w, h, None)
+            if chosen is not None:
+                self._last_rescue = True
+                if self.prev_corners is not None:
+                    self.prev_corners = None
+                    self.jump_candidate = None
+                    self.jump_streak = 0
+                print("    [center-prompt rescue]", flush=True)
         if chosen is None:
+            self.fail_streak += 1
             return None
-        corners, recon, comp = chosen
+        self.fail_streak = 0
+        corners, recon, comp, area = chosen
+
+        # C7② 网格线精修（2026-10-12 video_01 根治手段）：暗桌+深色边框条使物理边
+        # 对比度极低，掩码边界常「改跟」内部高对比线（边框内沿/网格线/绕棋子）→
+        # 顶部/TR 系统性内凹 40-150px，闸门类手段治不了边界语义错误。网格线高对比、
+        # 无二义、直接定义几何：把候选四角 rectify 后用真实网格线重拟合
+        # （refine.py 移植复用，2 轮迭代）。rms 未收敛/变差则保留原角（宁缺毋滥）。
+        if self.grid_refine:
+            try:
+                res = refine_corners(
+                    img, (corners.astype(np.float64) / np.array([w, h], np.float64)),
+                    iters=2, match_radius=30.0, ransac_reproj=6.0)
+                if res["grid_rms"] < self.GRID_RMS_MAX and res["n_nodes"] >= 12:
+                    corners = (res["corners_norm"] * np.array([w, h], np.float64)).astype(np.float32)
+                    self._last_refined = True
+                else:
+                    self._last_refined = False
+            except Exception:
+                self._last_refined = False
+        else:
+            self._last_refined = False
+
+        self._last_recon = recon
+        self._last_area = area
+        # D1 静止锚闸（前半，跳变闸之前）：静止时相对锚漂移 >0.4 格 = 伪成功，拒。
+        # 放 EMA/跳变闸之前 → 拒绝帧不污染 prevCorners 基线；按漏检走迟滞保持。
+        if self.imu_static and not self._anchor_check(corners):
+            self.fail_streak += 1
+            return None
         # P0-a 时间一致性闸
         if self.prev_corners is not None and self._is_jump(corners, self.prev_corners):
             consistent = (self.jump_candidate is not None
@@ -447,6 +775,9 @@ class EdgeSamDetector:
             self.jump_streak, self.jump_candidate = 0, None
         else:
             self.jump_streak, self.jump_candidate = 0, None
+        # D1 静止锚闸（后半）：跳变闸也过了的干净四角才喂锚（防坏帧污染锚）。
+        if self.imu_static:
+            self._anchor_feed(corners)
         # 提示点回灌（复原态用可见掩码质心，更稳）
         if recon:
             ys, xs = np.nonzero(comp)
@@ -458,6 +789,13 @@ class EdgeSamDetector:
             cen = corners.mean(0)
             self.prompt_x = float(np.clip(cen[0] / w, 0.02, 0.98))
             self.prompt_y = float(np.clip(cen[1] / h, 0.02, 0.98))
+        # 静止锚显示模式（用户标准：静止场景四角应完全一致）：显示=锚（恒定），
+        # 检测只是锚的维护者（滚动中位数，见 _anchor_feed）——检测自身的 ±20-40px
+        # 分钟级慢漂（box 随棋子走子呼吸）不进显示；prev 同步为锚保持一致性。
+        if self.imu_static and self.anchor is not None:
+            out = self.anchor.astype(np.float32)
+            self.prev_corners = out.astype(np.float64).copy()
+            return self._build_info(out)
         smoothed = self._smooth(corners, w, h).astype(np.float32)
         return self._build_info(smoothed)
 
@@ -475,6 +813,233 @@ class EdgeSamDetector:
             return None
         smoothed = self._smooth(refined, w, h).astype(np.float32)
         return self._build_info(smoothed)
+
+
+# ================================================================ BoardTracker（C9-T1 视觉帧间传播）
+
+class BoardTracker:
+    """LK 光流帧间单应传播（算法梳理 §9 T1；「棋盘不动、视角动」先验）。
+
+    帧间要解的只是相机位姿 = 图像间单应：
+      goodFeaturesToTrack（棋盘 ROI 掩码内）→ calcOpticalFlowPyrLK 前向+后向校验
+      → RANSAC findHomography → H_g2i ← H_lk @ H_g2i（棋盘系→当前图像系的累积单应）
+    每帧输出传播四角 = H_g2i ∙ PHYSICAL_CORNERS（~10ms → 30fps 显示）。
+    累积漂移由 EdgeSAM 定周期重锚纠正（REANCHOR_EVERY）；跟踪质量降（内点不足/
+    FB 误差大/单应退化/点数耗尽）立即触发重锚。遮挡期间跟踪继续（可见部分特征
+    足以拟合全局单应，运动棋子/手部点被 RANSAC 剔为外点）——这正是逐帧分割做不到的。
+    """
+
+    REANCHOR_EVERY = 15      # 跟踪健康时的定周期重锚（帧）≈0.5s，纠正累积漂移（25 时斜视角段传播小漂移显效，f426/f476/f560）
+    RECHECK_AFTER_FAIL = 5   # 重锚失败后的重试间隔（跟踪仍活着时不背靠背烧 SAM）
+    STALE_AGE = 75           # 传播陈旧逃生：超过此帧数未过准入闸时，无条件信 SAM 并重建参考
+    CORRECT_EVERY = 10       # 棋锚纠偏周期（帧）：重锚被闸拦下期间用棋子真值钉住 H（2026-10-14）
+    CORRECT_BACKING = 30     # 近期纠偏成功过的窗口（帧）：此窗口内传播有棋子背书，不走陈旧逃生
+    AGREE_CELL = 1.5         # 准入闸 v3：棋锚背书时 SAM 与传播四角的逐角最大容差（格）
+    DBG_CORRECT = False      # 调试：打印每次纠偏尝试的结果（含失败）
+
+    def __init__(self, max_points=250, min_distance=12, fb_max=2.5,
+                 min_track_pts=25, min_inliers=35, ransac_reproj=3.0):
+        self.max_points = max_points
+        self.min_distance = min_distance
+        self.fb_max = fb_max
+        self.min_track_pts = min_track_pts
+        self.min_inliers = min_inliers
+        self.ransac_reproj = ransac_reproj
+        self.prev_gray = None
+        self.pts = None           # (N,1,2) float32，当前帧跟踪点
+        self.H = None             # 3×3 棋盘系(canonical)→当前图像
+        self.age = 0              # 距上次成功重锚的帧数
+        self.last_correct_age = None  # 最近一次棋锚纠偏成功时的 age（seed 清空）
+        self.last_inliers = 0     # 诊断
+        self.n_track_frames = 0   # 指标：成功传播帧
+        self.n_fail = 0           # 指标：传播失败帧
+
+    def seed(self, gray, corners):
+        """EdgeSAM 重锚后播种：H 由检测四角计算；特征点在棋盘 ROI 内重提。"""
+        c = np.asarray(corners, np.float64).reshape(4, 2)
+        self.H = h_compute(PHYSICAL_CORNERS, c)
+        h, w = gray.shape[:2]
+        mask = np.zeros((h, w), np.uint8)
+        # ROI = 四角多边形外扩 ~0.35 格（棋盘内纹理为主，略含边框）
+        cell = EdgeSamDetector._cell_size(c) if hasattr(EdgeSamDetector, "_cell_size") else 60.0
+        pad = 0.35 * cell
+        roi = c.copy()
+        mid = c.mean(0)
+        roi = (c - mid) * (1 + 2 * pad / max(np.hypot(*(c - mid).T).max(), 1)) + mid
+        cv2.fillPoly(mask, [np.round(roi).astype(np.int32)], 1)
+        pts = cv2.goodFeaturesToTrack(
+            gray, maxCorners=self.max_points, qualityLevel=0.01,
+            minDistance=self.min_distance, blockSize=7, mask=mask)
+        self.pts = pts
+        self.prev_gray = gray
+        self.age = 0
+        self.last_correct_age = None
+
+    def corners(self):
+        if self.H is None:
+            return None
+        return h_transform(self.H, PHYSICAL_CORNERS)
+
+    def ref_to_image(self, ref_board):
+        """棋盘系参考点（棋子质心）→ 当前图像系（移动场景包含门/box 的关键）。"""
+        if self.H is None or ref_board is None or len(ref_board) == 0:
+            return None
+        return h_transform(self.H, np.asarray(ref_board, np.float64))
+
+    def track(self, gray):
+        """逐帧传播。返回 True=成功（corners() 可用）/ False=质量不足（应重锚）。"""
+        if self.H is None or self.prev_gray is None or self.pts is None \
+                or len(self.pts) < self.min_track_pts:
+            self.n_fail += 1
+            return False
+        lk = dict(winSize=(31, 31), maxLevel=3,
+                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.pts, None, **lk)
+        if p1 is None:
+            self.n_fail += 1
+            return False
+        p0r, st2, _ = cv2.calcOpticalFlowPyrLK(gray, self.prev_gray, p1, None, **lk)
+        good = (st.reshape(-1) == 1)
+        if st2 is not None:
+            good &= (st2.reshape(-1) == 1)
+        if good.sum() >= 8:
+            fb = np.linalg.norm(p0r[good] - self.pts[good], axis=2).reshape(-1)
+            good[np.where(good)[0][fb >= self.fb_max]] = False
+        if good.sum() < self.min_track_pts:
+            self.pts = None
+            self.n_fail += 1
+            return False
+        src = self.pts[good].reshape(-1, 1, 2)
+        dst = p1[good].reshape(-1, 1, 2)
+        Hlk, inl = cv2.findHomography(src, dst, cv2.RANSAC, self.ransac_reproj)
+        inl_n = 0 if inl is None else int(inl.sum())
+        det = 0.0 if Hlk is None else float(np.linalg.det(Hlk[:2, :2]))
+        if Hlk is None or inl_n < self.min_inliers or not (0.25 <= det <= 4.0) \
+                or not np.all(np.isfinite(Hlk)):
+            self.pts = None
+            self.n_fail += 1
+            return False
+        self.H = Hlk @ self.H
+        c = self.corners()
+        h, w = gray.shape[:2]
+        if (not np.all(np.isfinite(c)) or c[:, 0].min() < -w * 0.5 or c[:, 0].max() > w * 1.5
+                or c[:, 1].min() < -h * 0.5 or c[:, 1].max() > h * 1.5):
+            self.H = None
+            self.pts = None
+            self.n_fail += 1
+            return False
+        self.pts = dst
+        self.prev_gray = gray
+        self.age += 1
+        self.last_inliers = inl_n
+        self.n_track_frames += 1
+        return True
+
+    @staticmethod
+    def _unique_nearest(ref, proj, det_pts, radius):
+        """就近唯一匹配：投影参考 ↔ 最近质心（≤radius），距离升序贪心，一对一。"""
+        pairs = []
+        for i, p in enumerate(proj):
+            dd = np.linalg.norm(det_pts - p, axis=1)
+            j = int(dd.argmin())
+            if dd[j] <= radius:
+                pairs.append((float(dd[j]), i, j))
+        pairs.sort()
+        used_i, used_j, src, dst = set(), set(), [], []
+        for _, i, j in pairs:
+            if i in used_i or j in used_j:
+                continue
+            used_i.add(i)
+            used_j.add(j)
+            src.append(ref[i])
+            dst.append(det_pts[j])
+        return src, dst
+
+    def piece_correct(self, yolo, img, ref_board):
+        """棋子锚定纠偏（2026-10-14，video_03 f426/f476 诊断）。
+
+        重锚被准入闸连续拦下的快速移动段，LK 累积漂移无人纠正（f426 BR 外扩
+        30-40px，f491 漂移 127px→f527 749px）。棋子是独立于 SAM/LK 的第三方
+        真值源：ref_board（棋盘系质心，静止物理真值）↔ 当前帧 YOLO 质心 →
+        RANSAC 单应（内点 0.35 格）直接钉住 H——视频标注期「棋子锚定 RANSAC」
+        同款技术。两级匹配：
+          ① 就近唯一匹配（≤0.75 格）：漂移 <0.75 格时的快速路径；
+          ② PCA 粗对齐（免对应，video_label_yoloassist 同款）：两团点主轴 8 种
+             符号/换轴组合的相似变换对齐后吸附质心——漂移任意大都能恢复
+             （track5 教训：就近匹配捕获范围只有 0.75 格，拉近段 300px 漂移
+             恰好让它最需要时失灵）。镜像歧义由 det>0 闸拒绝（反射单应 det<0）。
+        成功返回纠偏量 px（四角均值位移），失败返回 None（保持传播 H）。
+        """
+        if self.H is None or not ref_board or len(ref_board) < 12:
+            return None
+        ref = np.asarray(ref_board, np.float64).reshape(-1, 2)
+        corners = self.corners()
+        dets, _ = yolo.detect(img, corners)
+        if len(dets) < 12:
+            # 大漂移时按漂移四角的裁剪会切掉棋子——外扩 1.5 倍重跑一次兜底
+            mid = np.asarray(corners, np.float64).reshape(4, 2).mean(0)
+            expanded = (np.asarray(corners, np.float64).reshape(4, 2) - mid) * 1.5 + mid
+            dets, _ = yolo.detect(img, expanded)
+        if len(dets) < 12:
+            return None
+        cell = float(EdgeSamDetector._cell_size(corners))
+        det_pts = np.asarray([[d[0], d[1]] for d in dets], np.float64)
+        proj = h_transform(self.H, ref)
+        src, dst = self._unique_nearest(ref, proj, det_pts, 0.75 * cell)
+        fits = [(np.asarray(src), np.asarray(dst))] if len(src) >= 12 else []
+        if not fits:
+            # ② PCA 粗对齐候选对（按匹配数降序，逐一试拟合）
+            def pca(x):
+                m = x.mean(0)
+                c = (x - m).T @ (x - m) / len(x)
+                w, v = np.linalg.eigh(c)
+                o = np.argsort(w)[::-1]
+                return m, v[:, o], w[o]
+            ms, vs, ws = pca(ref)
+            md, vd, wd = pca(det_pts)
+            cand = []
+            for swap in (False, True):
+                vs2 = vs[:, ::-1] if swap else vs
+                ws2 = ws[::-1] if swap else ws
+                for f0 in (1.0, -1.0):
+                    for f1 in (1.0, -1.0):
+                        R = vd @ np.diag([f0, f1]) @ vs2.T
+                        scale = np.sqrt(np.clip(wd, 1e-6, None)
+                                        / np.clip(ws2, 1e-6, None))
+                        p = md + (ref - ms) @ R.T * scale
+                        s2, d2 = self._unique_nearest(ref, p, det_pts, 1.2 * cell)
+                        if len(s2) >= 12:
+                            cand.append((len(s2), s2, d2))
+            cand.sort(key=lambda t: -t[0])
+            fits = [(np.asarray(s2), np.asarray(d2)) for _, s2, d2 in cand]
+        for src, dst in fits:
+            Hf, inl = cv2.findHomography(src, dst, cv2.RANSAC, 0.35 * cell)
+            n_in = 0 if inl is None else int(inl.sum())
+            det = 0.0 if Hf is None else float(np.linalg.det(Hf[:2, :2]))
+            det0 = float(np.linalg.det(self.H[:2, :2]))
+            # 尺度闸（分辨率无关，2026-10-15 真机教训）：相对当前 H 的比值 ∈[0.5,2]——
+            # 绝对闸 [0.25,4] 是 1080p 大棋盘标定，480p 手机棋盘 ~200px 合法 det≈0.1。
+            if Hf is None or n_in < 10 or not (det0 > 0 and 0.5 <= det / det0 <= 2.0) \
+                    or not np.all(np.isfinite(Hf)):
+                continue
+            # 旋转一致闸（2026-10-14 移植前夜发现）：标准开局点云 180° 旋转对称 →
+            # PCA 180° 组合把全部点匹配到镜像对位（count 满分、det>0 闸拦不住），
+            # 拟合出翻转 H。棋盘 10 帧纠偏周期内不可能转 40°+ → 轴向夹角闸拦翻转。
+            mid = np.array([[np.mean(PHYSICAL_CORNERS[:, 0]),
+                             np.mean(PHYSICAL_CORNERS[:, 1])]])
+            ax = (h_transform(Hf, mid + np.array([[100.0, 0.0]]))
+                  - h_transform(Hf, mid)).ravel()
+            ax0 = (h_transform(self.H, mid + np.array([[100.0, 0.0]]))
+                   - h_transform(self.H, mid)).ravel()
+            cosang = float(np.dot(ax, ax0) / (np.linalg.norm(ax) * np.linalg.norm(ax0) + 1e-9))
+            if cosang < np.cos(np.deg2rad(40.0)):
+                continue
+            shift = float(np.linalg.norm(
+                h_transform(Hf, PHYSICAL_CORNERS) - corners, axis=1).mean())
+            self.H = Hf
+            self.last_correct_age = self.age
+            return shift
+        return None
 
 
 # ================================================================ QuadRefiner（QuadRefiner.kt 移植）
@@ -644,6 +1209,32 @@ def snap_to_grid(dets, info):
     return grid
 
 
+# 标准开局参考点（棋盘系交点真值）：开局时 32 子的棋盘坐标完全已知——
+# 用它当 ref_board 可把「约定」钉到真实物理位置（不依赖任何检测四角），
+# 纠正种子级偏差（track7 教训：f41 种子 BR 外扩 25-40px 被棋锚纠偏忠实继承
+# 到全程）。任意一子走动即产生越位 → matches_std_opening 自动失效，中局回退
+# 质心投影约定（= 最近一次被接受检测的约定）。
+_STD_CELLS = ([(f, 0) for f in range(9)]              # 黑方底线：车马象士将士象马车（9 列全占）
+              + [(1, 2), (7, 2)]                        # 黑炮
+              + [(f, 3) for f in (0, 2, 4, 6, 8)]      # 黑卒
+              + [(f, 6) for f in (0, 2, 4, 6, 8)]      # 红兵
+              + [(1, 7), (7, 7)]                        # 红炮
+              + [(f, 9) for f in range(9)])             # 红方底线（9 列全占）
+STD_REF_BOARD = [[MARGIN + f * CELL, MARGIN + r * CELL] for f, r in _STD_CELLS]
+_STD_OCC_ARR = np.array([[1 if (f, r) in _STD_CELLS else 0
+                          for f in range(9)] for r in range(10)])
+
+
+def matches_std_opening(grid):
+    """几何性判据：≥20 个子落在标准开局交点上（extra 容忍 4——biased 四角下
+    个别子 snap 偏 1 格 / 幻影框 / 走子都不影响位置拟合：越位子只是 RANSAC
+    外点，身份与拟合无关）。走子多了 on_std 自然跌破 20 → 中局自动失效。"""
+    occ = np.array([[1 if grid[r][f] else 0 for f in range(9)] for r in range(10)])
+    on_std = int(((occ == 1) & (_STD_OCC_ARR == 1)).sum())
+    extra = int(((occ == 1) & (_STD_OCC_ARR == 0)).sum())
+    return on_std >= 20 and extra <= 4
+
+
 # ================================================================ 投票 / FEN / 记谱（MainActivity 移植）
 
 def vote_grid(history):
@@ -807,15 +1398,28 @@ def render(img, info, grid, dets, move, note, frame_no, state_txt):
 
 # ================================================================ 主循环（MainActivity.processFrame 移植）
 
-DETECT_EVERY_N, LOCK_MAX_MISSES, HISTORY_SIZE = 5, 3, 5
+DETECT_EVERY_N, LOCK_MAX_MISSES, HISTORY_SIZE = 5, 15, 5
 
 
-def run(video, out_dir, max_frames=0):
+def run(video, out_dir, max_frames=0, imu_mode="off", track=False):
     os.makedirs(out_dir, exist_ok=True)
     edge = EdgeSamDetector()
+    # 定稿（2026-10-14 用户看图裁决，A/B=compare_seed_ab）：**单种子+棋锚纠偏**胜出。
+    # 曾试「跟踪模式旁路 detect 内部包含门」（理由：真值参考下斜视角 SAM 内收
+    # 0.83-0.9<0.95 被内部门全拒→重锚断供）——但旁路后 47px 偏差的 f218 种子被
+    # 放进来刷新约定，f476 继承其 TL 偏差，用户判 B 版差。内部门保持开启：
+    # 斜视角段 detect 返回 None 不再是问题（棋锚纠偏承担传播精度，SAM 只需
+    # 好几何时供种）；tracker 死亡时 ref_img=None 走中心提示全新重锁兜底。
+    # grid_refine 同理试过又撤（track11 证伪：斜视角锁错线组，P3 陷阱移动场景
+    # 同样成立）。种子约定误差问题见 BoardTracker 方案文档 §0。
+    edge.set_imu_mode(imu_mode)   # PC 模拟：恒定三态（真机由 monitor 逐帧驱动）
     yolo = YoloDetectorPy()
     refiner = QuadRefinerPy()
     engine = Engine()
+    last_legal, last_legal_n = None, 0   # D3 合法参照（最近一次合法投票局面）
+    tracker = BoardTracker() if track else None
+    ref_board = None      # 棋盘系参考点（YOLO 质心经 imageToGrid 投影，静止于棋盘坐标系）
+    recheck_in = 0        # 跟踪活着但重锚失败后的重试倒计时（不背靠背烧 SAM）
 
     cap = cv2.VideoCapture(video)
     n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -835,24 +1439,169 @@ def run(video, out_dir, max_frames=0):
             break
         frame_counter += 1
         state = "保持"
-        if frame_counter % DETECT_EVERY_N == 0:
-            detected = edge.detect(img)
+        # 失败/未锁定期间加速采样（移动重锁修复 B，与端上同）：每帧都检。
+        every_n = 1 if (latest_info is None or lock_misses > 0) else DETECT_EVERY_N
+        # C9-T1 跟踪模式：LK 传播优先承担每帧四角（30fps 显示，遮挡期间继续），
+        # EdgeSAM 降频为事件触发重锚（无 H / 传播失败 / 定周期 REANCHOR_EVERY）。
+        prop_info = None
+        if tracker is not None:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            alive = tracker.track(gray) if tracker.H is not None else False
+            if alive:
+                # 棋锚纠偏：重锚被闸拦下 / SAM 候选不稳的快速移动段，用棋子真值
+                # 钉住 H，把 LK 累积漂移按周期清零（f426/f476 的根治项）。
+                if BoardTracker.DBG_CORRECT:
+                    print(f"    [age-dbg] f{frame_counter}: age={tracker.age} "
+                          f"nref={len(ref_board) if ref_board else 0}", flush=True)
+                corr = None
+                if ref_board and len(ref_board) >= 12 \
+                        and tracker.age % tracker.CORRECT_EVERY == 0:
+                    corr = tracker.piece_correct(yolo, img, ref_board)
+                    if corr is not None and corr > 8:
+                        print(f"    [correct] f{frame_counter}: 棋锚纠偏 "
+                              f"{corr:.0f}px", flush=True)
+                    elif BoardTracker.DBG_CORRECT:
+                        print(f"    [correct-dbg] f{frame_counter}: age={tracker.age} "
+                              f"corr={corr}", flush=True)
+                c = tracker.corners().astype(np.float32)
+                prop_info = {"corners": c,
+                             "imageToGrid": h_compute(c, PHYSICAL_CORNERS),
+                             "gridToImage": h_compute(PHYSICAL_CORNERS, c)}
+                latest_info = prop_info
+                state = (f"棋锚纠偏{corr:.0f}px" if corr is not None
+                         else f"跟踪{tracker.last_inliers}")
+            tracker_due = tracker.H is None or not alive or tracker.age >= tracker.REANCHOR_EVERY
+            want_detect = tracker_due and recheck_in <= 0
+            if recheck_in > 0:
+                recheck_in -= 1
+        else:
+            want_detect = frame_counter % every_n == 0
+        if want_detect:
+            # 参考点：跟踪模式用棋盘系参考经当前 H 投回图像（移动场景包含门/box 有效的
+            # 关键——图像系参考在相机一动就全体作废）；否则用上帧图像系质心。
+            ref_img = (tracker.ref_to_image(ref_board) if tracker is not None
+                       else (last_centroids if last_centroids else None))
+            detected = edge.detect(img, ref_img)
+            # 重锚准入闸（2026-10-14，video_03 诊断）：斜视角段 SAM 系统性内收 1 格的
+            # 候选会经 MOVING 态救援二级（绕包含门）混入——但跟踪模式下参考是经当前 H
+            # 投影的新鲜参考，绕门理由不成立。SAM 四角须包住 ≥0.9 投影参考才播种/更新
+            # 显示，否则丢弃本次检测、显示继续走传播；传播陈旧（≥STALE_AGE 未过闸）
+            # 时无条件信 SAM 并重建参考（防快甩后传播走歪卡死）。
+            if detected is not None and tracker is not None and prop_info is not None:
+                cont0 = (EdgeSamDetector._containment(
+                    np.asarray(detected["corners"], np.float64), ref_img)
+                    if ref_img is not None and len(ref_img) else 1.0)
+                med0 = (EdgeSamDetector._min_edge_dist(detected["corners"], ref_img)
+                        if ref_img is not None and len(ref_img) else 0.0)
+                med0_cell = med0 / EdgeSamDetector._cell_size(
+                    np.asarray(detected["corners"], np.float64)) if ref_img is not None else 0.0
+                # v2：包含率拦内收（<0.9），最小边距拦外扩（>1.0 格——真值 ~0.5 格，
+                # video_03 f138/f476 的外扩伪框实测 0.7-1.5 格）
+                if cont0 < 0.9 or med0_cell > 1.0:
+                    # 棋锚背书：近期纠偏成功过 = 传播有棋子真值钉着、不是陈旧，
+                    # 拦下的必是坏 SAM → 继续拦（防陈旧逃生用坏 SAM 顶掉好传播）。
+                    backed = (tracker.last_correct_age is not None
+                              and tracker.age - tracker.last_correct_age
+                              <= tracker.CORRECT_BACKING)
+                    if tracker.age < tracker.STALE_AGE or backed:
+                        d0 = float(np.linalg.norm(
+                            np.asarray(detected["corners"], np.float64) - tracker.corners(),
+                            axis=1).mean())
+                        print(f"    [reanchor] f{frame_counter}: 存疑保持（参考包含率 "
+                              f"{cont0:.2f}，最小边距 {med0_cell:.2f} 格，"
+                              f"SAM-传播偏差 {d0:.0f}px"
+                              f"{'，棋锚背书' if backed else ''}）", flush=True)
+                        latest_info = prop_info
+                        state = "重锚存疑"
+                        detected = None
+                    else:
+                        print(f"    [reanchor] f{frame_counter}: 陈旧逃生（包含率 {cont0:.2f}）"
+                              f"→ 信 SAM 重建参考", flush=True)
+                        ref_board = None
+            if detected is not None and tracker is not None and prop_info is not None \
+                    and ref_img is not None and len(ref_img):
+                # 准入闸 v3（2026-10-14 track5/6 教训）：棋锚背书时传播就是棋子真值
+                # 投影——SAM 须与传播四角逐角一致（≤AGREE_CELL 格）才准播种。
+                # track5/6 实测：纠偏静默生效（漂移 ~3.5px/10帧），f320/f365 的
+                # SAM quad 偏 296/664px 仍过 v2 闸（min 统计太弱：一个参考贴边即放行）
+                # → 坏种子投毒 ref_board → 纠偏把错误约定自洽钉死、detect 再不成功。
+                backed = (tracker.last_correct_age is not None
+                          and tracker.age - tracker.last_correct_age
+                          <= tracker.CORRECT_BACKING)
+                if backed:
+                    cell = EdgeSamDetector._cell_size(
+                        np.asarray(detected["corners"], np.float64))
+                    d_max = float(np.linalg.norm(
+                        np.asarray(detected["corners"], np.float64) - tracker.corners(),
+                        axis=1).max())
+                    if d_max > tracker.AGREE_CELL * cell:
+                        print(f"    [reanchor] f{frame_counter}: 棋锚否决"
+                              f"（SAM-传播最大角偏差 {d_max:.0f}px > "
+                              f"{tracker.AGREE_CELL} 格）", flush=True)
+                        latest_info = prop_info
+                        state = "重锚存疑"
+                        detected = None
             if detected is not None:
                 lock_misses = 0
                 info = detected
-                if len(last_centroids) >= 12:
-                    refined = refiner.refine(info["corners"], last_centroids)
+                # P0-b 质心精修：参考必须与当前画面同坐标系——跟踪模式用棋盘系参考经
+                # 当前 H 投回（图像系 last_centroids 相机一动即全体作废）。
+                refine_pts = (tracker.ref_to_image(ref_board)
+                              if tracker is not None and ref_board else last_centroids)
+                if refine_pts is not None and len(refine_pts) >= 12:
+                    refined = refiner.refine(info["corners"], refine_pts)
                     if refined is not None:
                         info = edge.refine_quad(refined, img.shape[1], img.shape[0]) or detected
                 dets, _ = yolo.detect(img, info["corners"])
                 last_centroids = [[d[0], d[1]] for d in dets]
+                if tracker is not None:
+                    # 诊断：SAM 重锚 vs 传播四角的偏差 + 对（投影后）参考的包含率
+                    prop_c = tracker.corners()
+                    cont = (EdgeSamDetector._containment(np.asarray(info["corners"], np.float64), ref_img)
+                            if ref_img is not None and len(ref_img) else 1.0)
+                    if prop_c is not None:
+                        d = float(np.linalg.norm(
+                            np.asarray(info["corners"], np.float64) - prop_c, axis=1).mean())
+                        print(f"    [reanchor] f{frame_counter}: SAM-传播偏差={d:.0f}px "
+                              f"参考包含率={cont:.2f}", flush=True)
+                    tracker.seed(gray, info["corners"])
                 grid = snap_to_grid(dets, info)
                 recent.append(grid)
                 while len(recent) > HISTORY_SIZE:
                     recent.pop(0)
                 voted = vote_grid(recent)
+                n_pc = sum(1 for r in range(10) for f in range(9) if voted[r][f])
+                # D3 投票门 v2（vis3 教训：is_illegal 当拒绝条件会因 YOLO 偶缺一帅逐帧
+                # 全拒→冻结；vis7 教训：is_illegal 恒真时参照永不建立→门旁路→>32 幽灵
+                # 泄漏）。自举：首个体检合格（20≤子数≤32）的投票即可当参照。
+                if last_legal is not None and (n_pc > 32 or n_pc < last_legal_n * 0.6):
+                    recent.pop()
+                    voted, n_pc = last_legal, last_legal_n
+                    state = "投票保持"
+                else:
+                    state = "检测OK"
+                # ref_board 重建：准入闸已保证新检测包住 ≥0.9 旧参考（或陈旧逃生
+                # 清空重建）——棋盘系质心坐标是静止物理真值，坏检测进不来。
+                # 标准开局约定重置（2026-10-14，track7 教训）：占位匹配标准开局时
+                # 改用标准交点真值——纠正种子级偏差（f41 BR 外扩 25-40px 被棋锚
+                # 纠偏忠实继承到全程）。
+                if tracker is not None and last_centroids:
+                    occ = np.array([[1 if voted[r][f] else 0 for f in range(9)]
+                                    for r in range(10)])
+                    _on = int(((occ == 1) & (_STD_OCC_ARR == 1)).sum())
+                    _ex = int(((occ == 1) & (_STD_OCC_ARR == 0)).sum())
+                    print(f"    [std-dbg] f{frame_counter}: on_std={_on} extra={_ex}",
+                          flush=True)
+                    if matches_std_opening(voted):
+                        ref_board = [list(p) for p in STD_REF_BOARD]
+                        print(f"    [ref-reset] f{frame_counter}: "
+                              f"标准开局约定重置（32 交点）", flush=True)
+                    else:
+                        ref_board = h_transform(
+                            info["imageToGrid"], np.asarray(last_centroids)).tolist()
                 latest_info, latest_grid, latest_dets = info, voted, dets
-                state = "检测OK"
+                if not is_illegal(voted) or (last_legal is None and 20 <= n_pc <= 32):
+                    last_legal, last_legal_n = voted, n_pc
                 fen = grid_to_fen(voted)
                 if fen != last_fen:
                     # 与 App 一致：不设合法性门，直接问引擎（驱动内部兜住无解/异常）。
@@ -863,18 +1612,51 @@ def run(video, out_dir, max_frames=0):
                     else:
                         suggest, suggest_note = None, None
                     last_fen = fen
-                n_pc = sum(1 for r in range(10) for f in range(9) if voted[r][f])
                 print(f"    f{frame_counter}: 检出{len(dets)} 投票后{n_pc}子 "
                       f"建议={suggest_note}", flush=True)
             else:
-                lock_misses += 1
-                state = f"漏检{lock_misses}"
+                if tracker is not None and tracker.H is not None:
+                    # 跟踪还活着：显示由传播承担，节流重试重锚（不烧 SAM）
+                    recheck_in = tracker.RECHECK_AFTER_FAIL
+                    state = "重锚节流"
+                    lock_misses = 0
+                else:
+                    lock_misses += 1
+                    state = f"漏检{lock_misses}"
                 if lock_misses > LOCK_MAX_MISSES:
-                    latest_info, latest_grid, latest_dets = None, None, []
-                    recent, last_centroids = [], []
-                    suggest, suggest_note, last_fen = None, None, None
-                    state = "丢失"
-        vis = render(img, latest_info, latest_grid, latest_dets, suggest,
+                    if edge.imu_static and latest_info is not None:
+                        # D2 静止不清屏：IMU 判静止 ⇒ 棋盘没动，长漏检=手遮挡——
+                        # 显示保持最后好四角/局面，检测层照常 fast-sampling 重试，
+                        # 重锁成功后无缝衔接。真清屏只发生在移动/未知态。
+                        state = "静止保持"
+                    else:
+                        latest_info, latest_grid, latest_dets = None, None, []
+                        recent, last_centroids = [], []
+                        suggest, suggest_note, last_fen = None, None, None
+                        edge.reset_tracking_state()   # 移动重锁修复 C（与端上同）
+                        if tracker is not None:
+                            tracker.H, tracker.pts, tracker.prev_gray = None, None, None
+                        state = "丢失"
+                # D1 挪盘兜底（双确认③内容验证）：超时+整体平移候选 → 用它跑 YOLO 取
+                # 当前帧棋子质心（棋盘被挪则棋子随行）→ 包含 ≥95% 且 ≥10 个才清锚重锁。
+                cand = edge.reanchor_candidate()
+                if cand is not None:
+                    dets, _ = yolo.detect(img, cand)
+                    cents = [[d[0], d[1]] for d in dets]
+                    okv = (len(cents) >= EdgeSamDetector.MIN_REF_PTS and
+                           EdgeSamDetector._containment(cand, cents) >= EdgeSamDetector.CONTAIN_MIN)
+                    edge.resolve_reanchor(okv)
+                    if okv:
+                        last_centroids = []      # 旧位置参考作废（与端上 resolveReanchor 同）
+                        state = "挪盘重锚"
+                    else:
+                        print(f"    [anchor] 挪盘双确认否决（{len(cents)} 质心）→ 保持", flush=True)
+        dets_show = latest_dets
+        if latest_info is not None and dets_show:
+            q = np.asarray(latest_info["corners"], np.float64).reshape(4, 2)
+            dets_show = [d for d in dets_show
+                         if EdgeSamDetector._point_in_quad(q, d[0], d[1])]
+        vis = render(img, latest_info, latest_grid, dets_show, suggest,
                      suggest_note or "", frame_counter, state)
         cv2.imwrite(os.path.join(out_dir, f"frame_{frame_counter:05d}.jpg"), vis,
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -883,6 +1665,9 @@ def run(video, out_dir, max_frames=0):
             print(f"  {frame_counter}/{limit}  {time.time()-t0:.0f}s  "
                   f"建议={suggest_note}", flush=True)
     cap.release()
+    if tracker is not None:
+        print(f"[track] 传播成功帧={tracker.n_track_frames} 传播失败帧={tracker.n_fail} "
+              f"最近内点={tracker.last_inliers}", flush=True)
     print(f"[done] {n_out} 帧 -> {out_dir}  总耗时 {time.time()-t0:.0f}s", flush=True)
 
 
@@ -890,4 +1675,7 @@ if __name__ == "__main__":
     video = sys.argv[1]
     out = sys.argv[2]
     EdgeSamDetector.QUAD_MODE = opt("--quad-mode", "hull")   # hull（默认，线上行为）| line（C5 边线求交，失败自动回退 hull）
-    run(video, out, int(opt("--max", "0")))
+    # --imu static：PC 模拟 IMU 静止（锚闸 D1 + 不清屏 D2 + 投票门 D3 + 仲裁）；
+    # moving=模拟移动（救援二级启用）；缺省 off=UNKNOWN（行为与 S7 完全一致）。
+    run(video, out, int(opt("--max", "0")), imu_mode=opt("--imu", "off"),
+        track=(opt("--track", "off") == "on"))
