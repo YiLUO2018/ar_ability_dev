@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VLM 架构方案（含评审修订）</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+           max-width: 960px; margin: 24px auto; padding: 0 20px;
+           color: #1f2937; line-height: 1.7; background: #fafafa; }
+    h1 { border-bottom: 3px solid #7c3aed; padding-bottom: 8px; color: #4c1d95; }
+    h2 { border-left: 5px solid #7c3aed; padding-left: 10px; margin-top: 2em; }
+    h3 { color: #6d28d9; margin-top: 1.6em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; background: #fff; }
+    th, td { border: 1px solid #d1d5db; padding: 6px 10px; text-align: left; }
+    th { background: #ede9fe; }
+    tr:nth-child(even) { background: #f9fafb; }
+    code { background: #eef2ff; padding: 1px 5px; border-radius: 3px;
+           font-family: Consolas, monospace; font-size: 0.92em; }
+    pre { background: #1e1e2e; color: #cdd6f4; padding: 14px; border-radius: 8px;
+          overflow-x: auto; }
+    pre code { background: none; color: inherit; padding: 0; }
+    blockquote { border-left: 4px solid #f59e0b; background: #fffbeb;
+                 margin: 1em 0; padding: 8px 14px; }
+    blockquote p { margin: 0.4em 0; }
+    a { color: #7c3aed; }
+    .footer { color: #9ca3af; font-size: 0.85em; text-align: center;
+              margin-top: 48px; border-top: 1px solid #e5e7eb; padding-top: 12px; }
+    .mermaid { background: #fff; padding: 12px; border-radius: 8px;
+               border: 1px solid #e5e7eb; text-align: center; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
+</head>
+<body>
+<h1>象棋视频识别与走子建议系统 — 完整架构设计</h1>
+<blockquote>
+<p>完整架构设计文档 · 基于共享视觉编码器 + 检测头 + Pikafish 引擎 + Qwen 语言塔
+目标硬件：RTX 4060 8GB · 基座模型：Qwen 2B / 4B
+日期：2026-10-16 归档（原文档 <code>vlm方案.html</code> 转录）｜<strong>含 2026-10-16 评审修订</strong>（标 ⚡ 修订 的段落为评审新增/修改，原文其余部分保持原样）
+产品定位（建项时澄清）：<strong>电脑端程序</strong>，与手机 AR 教练 App（<code>chinese_chess_coach_phone_version</code>）为姊妹项目。</p>
+</blockquote>
+<h2>目录</h2>
+<ol>
+<li>设计目标与核心思路</li>
+<li>整体架构图</li>
+<li>模块详解</li>
+<li>数据流与接口</li>
+<li>分阶段训练策略</li>
+<li>RTX 4060 显存预算</li>
+<li>与 Qwen-Drive 的对比</li>
+<li>关键设计决策与权衡</li>
+<li>⚡ 与手机项目方案 A 的关系（评审新增）</li>
+<li>⚡ 事实一致性自动闸（评审新增）</li>
+<li>⚡ 修订后落地顺序（评审新增）</li>
+</ol>
+<h2>1. 设计目标与核心思路</h2>
+<h3>1.1 系统目标</h3>
+<p>基于真实象棋视频/图像，实现以下能力：</p>
+<ul>
+<li><strong>视觉感知</strong>：从画面中识别棋盘角点与棋子位置</li>
+<li><strong>局面重建</strong>：将检测结果映射为标准的 FEN 局面表示</li>
+<li><strong>走子建议</strong>：调用 Pikafish 引擎计算最佳走法、评分与候选变化</li>
+<li><strong>智能评论</strong>：结合局面、引擎分析、视觉场景，生成自然语言讲解与教学评论</li>
+<li><strong>可视化渲染</strong>：将检测框、棋盘状态、推荐走法、评论文字叠加回原画面</li>
+</ul>
+<h3>1.2 核心设计思路</h3>
+<ul>
+<li><strong>共享视觉基座</strong>：图像只经过一次 Vision Encoder，检测头与语言塔共享其视觉特征，避免重复计算，保证语义一致。</li>
+<li><strong>检测与语言双分支</strong>：检测头读取空间特征图做精确定位；语言塔读取投影后的视觉 token 做场景理解，两路适配器分离。</li>
+<li><strong>专用模块做专用事</strong>：检测头负责"找棋子"，Pikafish 负责"算走法"，Qwen 负责"说人话"，各司其职。</li>
+<li><strong>引擎不替代、模型不越界</strong>：不让 VLM 学下棋，而是让它编排引擎、解释结果、生成评论。</li>
+<li><strong>分阶段训练</strong>：检测头、投影层、语言塔 LoRA 依次训练，4060 显存可控。</li>
+</ul>
+<h3>1.3 系统边界</h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>负责</th>
+<th>不负责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vision Encoder</td>
+<td>提取通用视觉特征</td>
+<td>不做具体检测或语言生成</td>
+</tr>
+<tr>
+<td>棋盘角点检测头</td>
+<td>定位 4 个棋盘角点</td>
+<td>不识别棋子</td>
+</tr>
+<tr>
+<td>棋子检测头（DETR）</td>
+<td>输出棋子边界框 + 类别</td>
+<td>不生成 FEN、不下棋</td>
+</tr>
+<tr>
+<td>Pikafish</td>
+<td>FEN → 最佳走法 + 评分 + PV</td>
+<td>不生成自然语言</td>
+</tr>
+<tr>
+<td>Qwen 语言塔</td>
+<td>局面讲解、走法解释、评论生成</td>
+<td>不做精细定位、不做搜索</td>
+</tr>
+</tbody>
+</table>
+<h2>2. 整体架构图</h2>
+<div class="mermaid">flowchart TB
+    INPUT["输入：棋盘图像 / 视频帧"]
+    INPUT --> VE
+    subgraph VE["共享视觉编码器 Vision Encoder（DINOv2/v3 · SigLIP · CLIP）"]
+        VEOUT["输出：单尺度特征图 (B, N, D)"]
+    end
+    subgraph DET["检测分支（空间特征适配 + 检测头）"]
+        ADAPT1["检测适配层：reshape 为 2D + Neck"]
+        HEAD1["棋盘角点检测头：4 关键点"]
+        HEAD2["棋子检测头（DETR）：边界框 + 类别"]
+        POST["透视变换 + 网格映射"]
+        FEN["FEN 局面字符串"]
+    end
+    VEOUT --> ADAPT1 --> HEAD1
+    ADAPT1 --> HEAD2
+    HEAD1 --> POST
+    HEAD2 --> POST --> FEN
+    subgraph ENG["决策引擎"]
+        PIKA["Pikafish 中国象棋引擎"]
+        ENGINE_OUT["最佳走法 + 评分 + PV"]
+    end
+    FEN --> PIKA --> ENGINE_OUT
+    subgraph LANG["语言分支（投影 + 语言塔）"]
+        PROJ["投影层：MLP / Q-Former"]
+        VTOKEN["视觉 token 序列"]
+        QWEN["Qwen 2B/4B 语言塔"]
+        OUTPUT["局面讲解 + 走法解释 + 评论"]
+    end
+    VEOUT --> PROJ --> VTOKEN
+    FEN --> QWEN
+    ENGINE_OUT --> QWEN
+    VTOKEN --> QWEN
+    USER["用户问题 / 语音指令"] --> QWEN --> OUTPUT
+    subgraph VIS["可视化渲染层"]
+        R1["检测框 / 角点叠加"]
+        R2["棋盘状态面板"]
+        R3["推荐走法箭头 + 评分条"]
+        R4["评论文字 / 对话气泡"]
+        FINAL["最终渲染画面"]
+    end
+    HEAD1 --> R1
+    HEAD2 --> R1
+    FEN --> R2
+    ENGINE_OUT --> R3
+    OUTPUT --> R4
+    R1 --> FINAL
+    R2 --> FINAL
+    R3 --> FINAL
+    R4 --> FINAL
+</div>
+<h2>3. 模块详解</h2>
+<h3>3.1 共享视觉编码器</h3>
+<p>核心：图像只经过一次编码，检测头和语言塔共享同一套视觉表征。</p>
+<table>
+<thead>
+<tr>
+<th>候选模型</th>
+<th>特点</th>
+<th>适用性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DINOv2 / DINOv3</td>
+<td>自监督预训练，冻结特征质量极高，擅长密集预测</td>
+<td>推荐（角点、边缘敏感）</td>
+</tr>
+<tr>
+<td>SigLIP</td>
+<td>图文对齐预训练，语义理解强</td>
+<td>可选（语言对齐友好）</td>
+</tr>
+<tr>
+<td>CLIP ViT</td>
+<td>生态成熟，社区资源多</td>
+<td>备选（分辨率偏低）</td>
+</tr>
+<tr>
+<td>Qwen-VL 自带 ViT</td>
+<td>与 Qwen 语言塔天然对齐</td>
+<td>推荐（省去投影层训练）</td>
+</tr>
+</tbody>
+</table>
+<p>输出格式：单尺度特征图 (B, N, D) 或 (B, D, H, W)，其中 N 为 patch 数量，D 为特征维度。</p>
+<h3>3.2 检测分支</h3>
+<h4>3.2.1 检测适配层</h4>
+<p>Vision Encoder 输出的是单尺度序列特征，检测头需要 2D 空间结构或多尺度金字塔。适配层负责：</p>
+<ul>
+<li><strong>reshape</strong>：将 (B, N, D) 还原为 (B, D, H, W)</li>
+<li><strong>Neck</strong>：从中间层抽取多尺度特征（可选，针对小目标棋子）</li>
+<li><strong>位置编码</strong>：为 DETR 头注入 2D 位置信息</li>
+</ul>
+<h4>3.2.2 棋盘角点检测头</h4>
+<p>关键角点检测是后续透视变换的前提，精度直接影响 FEN 正确性。</p>
+<ul>
+<li>设计：4 关键点回归（A0、A8、J0、J8 四个角）</li>
+<li>参考：YOLO-Pose 的角点检测思路，pose loss 权重可调高至 24.0</li>
+<li>输出：4 个 (x, y) 坐标 + 置信度</li>
+</ul>
+<h4>3.2.3 棋子检测头（DETR）</h4>
+<p>推荐用 DETR head 而非 YOLO head，因为 DETR 天然接受 ViT 的单尺度序列输出。</p>
+<ul>
+<li>输入：适配后的特征序列 + 位置编码</li>
+<li>输出：N 个 query，每个预测 (边界框, 类别, 置信度)</li>
+<li>类别：红/黑 × 车马象士将炮兵 = 14 类</li>
+<li>训练：匈牙利匹配 + 集合预测损失</li>
+</ul>
+<h4>3.2.4 透视变换与网格映射</h4>
+<pre><code>角点检测结果 → 透视变换（拉直棋盘）→ 标准俯视图
+                ↓
+棋子边界框中心点 → 映射到 9×10 网格坐标
+                ↓
+              生成 FEN 字符串
+</code></pre>
+<blockquote>
+<p>⚡ 修订注：角点顺序/网格映射约定应与手机项目 <code>BoardGeometry</code>（TL,TR,BR,BL + MARGIN/CELL canonical 系）对齐，保证 v10 数据集跨项目通用。</p>
+</blockquote>
+<h3>3.3 决策引擎：Pikafish</h3>
+<p><strong>不可替代</strong>：Pikafish 是确定性搜索引擎，棋力远超任何大模型。</p>
+<table>
+<thead>
+<tr>
+<th>输出项</th>
+<th>说明</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最佳走法</td>
+<td>如 炮二平五</td>
+<td>推荐给用户、可视化箭头</td>
+</tr>
+<tr>
+<td>评分</td>
+<td>Centipawn，如 +35</td>
+<td>判断优劣、渲染评分条</td>
+</tr>
+<tr>
+<td>PV（主变）</td>
+<td>后续若干步最佳应对</td>
+<td>生成"如果…则…"的评论</td>
+</tr>
+<tr>
+<td>搜索深度</td>
+<td>如 depth=28</td>
+<td>评估分析可信度</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚡ 修订注：Pikafish 为 GPL 协议——PC 工具链使用无碍；若未来服务化对外提供需复核协议。</p>
+</blockquote>
+<h3>3.4 语言分支</h3>
+<h4>3.4.1 投影层</h4>
+<p>将 Vision Encoder 的视觉特征映射到语言塔的词嵌入空间。</p>
+<ul>
+<li>方案 A：<strong>MLP</strong>：2-3 层全连接，轻量，LLaVA 标准做法</li>
+<li>方案 B：<strong>Q-Former</strong>：可学习 query 压缩视觉 token，BLIP-2 做法</li>
+<li>方案 C：<strong>直接复用 Qwen-VL 自带投影</strong>：省去训练</li>
+</ul>
+<h4>3.4.2 语言塔（Qwen 2B / 4B）</h4>
+<p>核心：语言塔是系统的"嘴巴和教练"，负责把结构化信息翻译成自然语言。</p>
+<p>输入组成：</p>
+<table>
+<thead>
+<tr>
+<th>输入来源</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FEN</td>
+<td>检测分支告诉模型"局面是什么"</td>
+</tr>
+<tr>
+<td>引擎走法 + 评分 + PV</td>
+<td>Pikafish 告诉模型"为什么这步好"</td>
+</tr>
+<tr>
+<td>视觉 token</td>
+<td>投影层告诉模型"现在是什么场景"</td>
+</tr>
+<tr>
+<td>用户问题</td>
+<td>ASR / 文本，告诉模型"用户想知道什么"</td>
+</tr>
+</tbody>
+</table>
+<p>输出示例：</p>
+<ul>
+<li>局面讲解："红方中炮对屏风马，双方子力均衡"</li>
+<li>走法解释："炮二平五控制中路，给左翼马让路"</li>
+<li>评论教学："这步是稳健开局，如果你想搏杀可以试试炮八平五"</li>
+<li>交互回答："你上一步马八进七过早，导致右翼空虚"</li>
+</ul>
+<h3>3.5 可视化渲染层</h3>
+<p>参考 Qwen-Drive 的"显式探针"理念，所有中间结果都可视叠加：</p>
+<table>
+<thead>
+<tr>
+<th>可视化元素</th>
+<th>数据来源</th>
+<th>渲染方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>棋盘角点</td>
+<td>角点检测头</td>
+<td>四点连线框</td>
+</tr>
+<tr>
+<td>棋子检测框</td>
+<td>棋子检测头</td>
+<td>边界框 + 类别标签</td>
+</tr>
+<tr>
+<td>棋盘状态面板</td>
+<td>FEN</td>
+<td>侧边栏 9×10 网格图</td>
+</tr>
+<tr>
+<td>推荐走法</td>
+<td>Pikafish</td>
+<td>箭头 + 高亮起止格</td>
+</tr>
+<tr>
+<td>评分条</td>
+<td>Pikafish</td>
+<td>红黑方优势条</td>
+</tr>
+<tr>
+<td>评论文字</td>
+<td>Qwen</td>
+<td>对话气泡 / 字幕</td>
+</tr>
+</tbody>
+</table>
+<h2>4. 数据流与接口</h2>
+<h3>4.1 推理数据流</h3>
+<pre><code>视频帧
+  ├─→ Vision Encoder ──→ 特征图
+  │                         ├─→ 检测适配层 ─→ 角点头 + 棋子头
+  │                         │                      │
+  │                         │                      ▼
+  │                         │              透视变换 + 网格映射
+  │                         │                      │
+  │                         │                      ▼
+  │                         │                    FEN
+  │                         │                      │
+  │                         │                      ▼
+  │                         │                 Pikafish
+  │                         │                      │
+  │                         │                      ▼
+  │                         │              走法 + 评分 + PV
+  │                         │                      │
+  │                         └─→ 投影层 ─→ 视觉 token
+  │                                                │
+  └────────────────────────────────────────────────┤
+                                                   ▼
+                                          Qwen 语言塔
+                                                   │
+                                                   ▼
+                                          评论 / 讲解 / 交互
+                                                   │
+                                                   ▼
+                                            可视化渲染 → 最终画面
+</code></pre>
+<h3>4.2 关键接口格式</h3>
+<p><strong>检测头 → FEN</strong></p>
+<pre><code class="language-json">{
+  &quot;board_corners&quot;: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],
+  &quot;pieces&quot;: [
+    {&quot;bbox&quot;: [x, y, w, h], &quot;class&quot;: &quot;red_pao&quot;, &quot;confidence&quot;: 0.96}
+  ]
+}
+</code></pre>
+<p>→ 透视变换 + 网格映射 →</p>
+<pre><code>rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1
+</code></pre>
+<p><strong>Pikafish → 语言塔</strong></p>
+<pre><code class="language-json">{
+  &quot;fen&quot;: &quot;rnbakabnr/9/1c5c1/...&quot;,
+  &quot;best_move&quot;: &quot;炮二平五&quot;,
+  &quot;score&quot;: &quot;+35&quot;,
+  &quot;pv&quot;: [&quot;炮二平五&quot;, &quot;马8进7&quot;, &quot;马二进三&quot;],
+  &quot;depth&quot;: 28
+}
+</code></pre>
+<p><strong>语言塔输入 prompt 模板</strong></p>
+<pre><code>[视觉 token 序列]
+
+当前局面 FEN：
+rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1
+
+引擎分析：
+- 最佳走法：炮二平五
+- 评分：+35（红方略优）
+- 主变：炮二平五 马8进7 马二进三
+
+用户问题：这步棋为什么好？
+
+请结合当前局面和引擎分析，给出讲解。
+</code></pre>
+<h2>5. 分阶段训练策略</h2>
+<p>原则：分阶段解冻，避免检测损失与语言损失互相干扰，4060 显存全程可控。</p>
+<h3>5.1 训练阶段</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>训练内容</th>
+<th>冻结内容</th>
+<th>数据</th>
+<th>显存</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>阶段 1：检测头训练</td>
+<td>角点头 + 棋子检测头 + 适配层</td>
+<td>Vision Encoder + 语言塔</td>
+<td>标注棋盘图像（角点 + 棋子框）</td>
+<td>~3-4 GB</td>
+</tr>
+<tr>
+<td>阶段 2：投影层训练</td>
+<td>投影层</td>
+<td>Encoder + 检测头 + 语言塔</td>
+<td>(图像, 评论) 对</td>
+<td>~2-3 GB</td>
+</tr>
+<tr>
+<td>阶段 3：语言塔 LoRA</td>
+<td>投影层 + Qwen LoRA</td>
+<td>Encoder + 检测头</td>
+<td>(FEN, 着法, 引擎信息, 评论)</td>
+<td>~4-5 GB</td>
+</tr>
+<tr>
+<td>~~阶段 4：联合微调~~</td>
+<td>⚡ 修订：<strong>删除</strong>——原文自列梯度冲突风险，收益不明，是全计划性价比最差的一段</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>⚡ 修订：<strong>插入 B0（阶段 3 的纯文本前置）</strong>——先跑「FEN + 引擎信息 → Qwen（无视觉 token）」验证讲解质量：
+Pikafish 批跑 + 5.3 评论语料构建即可，零视觉成本；讲解质量过关再投阶段 2 投影层训练。
+原文 §8.5 已承认视觉 token 的边际价值是「语气/场景」——把它放在被验证需要的位置上。</p>
+</blockquote>
+<h3>5.2 语言塔预训练（独立进行，⚡ 修订：升级为独立工作包）</h3>
+<p>基础：在投影层训练之前，先让语言塔"懂象棋"。</p>
+<ul>
+<li>数据：教材、棋谱、视频音频字幕、规则讲解</li>
+<li>方法：Continual Pre-Training + 指令微调</li>
+<li>目标：让 Qwen 理解"炮二平五""屏风马""先手"等术语与语感</li>
+<li>注意：ASR 字幕需做术语纠错，过滤闲聊与广告</li>
+</ul>
+<blockquote>
+<p>⚡ 修订注：语料工程（版权、清洗、ASR 术语纠错）是<strong>真实的主要成本</strong>，原文估算偏乐观——列为独立工作包管理，不与训练阶段耦合。</p>
+</blockquote>
+<h3>5.3 数据构建流程</h3>
+<pre><code>棋谱库
+  ├─→ Pikafish 批量分析 ─→ (FEN, 着法, 评分, PV)
+  │                              ├─→ 模板生成初版评论
+  │                              └─→ GPT-4 生成精版评论
+  │                                       ↓
+  │                                  人工筛选/修正
+  │                                       ↓
+  └─────────────────────────→ (FEN, 着法, 引擎信息, 评论) 训练数据
+</code></pre>
+<p>成本估算：</p>
+<table>
+<thead>
+<tr>
+<th>环节</th>
+<th>成本</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pikafish 分析</td>
+<td>几乎免费</td>
+<td>可批量跑</td>
+</tr>
+<tr>
+<td>模板生成</td>
+<td>免费</td>
+<td>冷启动，覆盖量大</td>
+</tr>
+<tr>
+<td>GPT-4 生成</td>
+<td>$0.01-0.05/条</td>
+<td>精版评论</td>
+</tr>
+<tr>
+<td>人工筛选</td>
+<td>主要成本</td>
+<td>5000 条足够阶段 3</td>
+</tr>
+</tbody>
+</table>
+<h2>6. RTX 4060 显存预算</h2>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>推理显存</th>
+<th>训练显存</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vision Encoder（DINOv2-B）</td>
+<td>~0.5 GB（冻结）</td>
+<td>~0.5 GB</td>
+<td>前向传播</td>
+</tr>
+<tr>
+<td>检测头（DETR）</td>
+<td>~0.3 GB</td>
+<td>~1.5 GB</td>
+<td>阶段 1 训练</td>
+</tr>
+<tr>
+<td>投影层</td>
+<td>~0.1 GB</td>
+<td>~0.5 GB</td>
+<td>阶段 2 训练</td>
+</tr>
+<tr>
+<td>Qwen 2B（4-bit QLoRA）</td>
+<td>~2.5 GB</td>
+<td>~4-5 GB</td>
+<td>阶段 3 训练</td>
+</tr>
+<tr>
+<td>Qwen 4B（4-bit QLoRA）</td>
+<td>~3.5 GB</td>
+<td>~6-7 GB</td>
+<td>阶段 3 勉强</td>
+</tr>
+<tr>
+<td>Pikafish</td>
+<td>CPU / ~0.2 GB</td>
+<td>—</td>
+<td>走 CPU 更省显存</td>
+</tr>
+<tr>
+<td>渲染与 UI</td>
+<td>~0.5 GB</td>
+<td>—</td>
+<td>OpenCV / 浏览器</td>
+</tr>
+</tbody>
+</table>
+<p>部署建议：</p>
+<ul>
+<li>推理：Qwen 2B + 检测头 + Encoder 同时加载，约 4-5 GB，4060 完全够用</li>
+<li>训练：各阶段分开跑，单阶段峰值不超过 5 GB</li>
+<li>实时性：YOLO/DETR 检测走 GPU，Pikafish 走 CPU，Qwen 按需调用</li>
+</ul>
+<h2>7. 与 Qwen-Drive 的对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Qwen-Drive</th>
+<th>本系统</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>共享基座</td>
+<td>Qwen3.5-4B VLM</td>
+<td>Vision Encoder（DINOv2/SigLIP）+ Qwen</td>
+</tr>
+<tr>
+<td>外挂感知头</td>
+<td>BEV 感知头（3D 检测 + 占用 + 分割）</td>
+<td>角点头 + 棋子检测头（DETR）</td>
+</tr>
+<tr>
+<td>外挂规划专家</td>
+<td>扩散 Transformer 生成轨迹</td>
+<td>Pikafish 搜索走法</td>
+</tr>
+<tr>
+<td>耦合方式</td>
+<td>紧耦合，外挂模块从 VLM 特征读取</td>
+<td>紧耦合，检测头与语言塔共享 Encoder</td>
+</tr>
+<tr>
+<td>显式探针</td>
+<td>3D 框、地图分割可视化</td>
+<td>角点、棋子框、FEN、走法箭头</td>
+</tr>
+<tr>
+<td>规划方式</td>
+<td>模型学习轨迹生成</td>
+<td>引擎搜索 + 模型解释</td>
+</tr>
+<tr>
+<td>核心差异</td>
+<td>规划由模型完成</td>
+<td><strong>规划由引擎完成，模型只解释</strong></td>
+</tr>
+</tbody>
+</table>
+<p>为什么本系统不让模型做规划？</p>
+<ul>
+<li>象棋搜索空间 10^40+，语言 token 空间无法覆盖</li>
+<li>引擎每秒搜索数百万节点，模型无法匹敌</li>
+<li>走法最优性无快速验证器，模型无法自我纠正</li>
+<li>实时性要求毫秒级，模型推理延迟过高</li>
+</ul>
+<p>模型负责"编排引擎 + 解释结果 + 生成评论"，这是它最擅长的能力区间。</p>
+<h2>8. 关键设计决策与权衡</h2>
+<h3>8.1 为什么用 DETR head 而非 YOLO head？</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>YOLO head</th>
+<th>DETR head</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>输入格式</td>
+<td>需要多尺度特征金字塔</td>
+<td>单尺度序列即可</td>
+</tr>
+<tr>
+<td>与 ViT 匹配</td>
+<td>需额外 Neck 适配</td>
+<td>天然匹配</td>
+</tr>
+<tr>
+<td>训练复杂度</td>
+<td>需 Anchor 设计</td>
+<td>匈牙利匹配，端到端</td>
+</tr>
+<tr>
+<td>成熟案例</td>
+<td>YOLO 生态</td>
+<td>RF-DETR、DINO-DETR</td>
+</tr>
+</tbody>
+</table>
+<p>结论：DETR head 与 ViT 输出格式天然匹配，是共享 Encoder 架构下的首选。</p>
+<blockquote>
+<p>⚡ 修订注：<strong>RF-DETR 本身就是「DINOv2 底座 + DETR 头」的成熟开源实现</strong>（手机项目方案 A 的标注主力）。
+阶段 1 的检测分支应<strong>直接以 RF-DETR 为起点</strong>（含 4 角点关键点扩展），而非从零自建适配层 + DETR 头——
+省掉 Hungarian 匹配/查询数/Neck 的一整套调参。本节结论不变，实现路径修正。</p>
+</blockquote>
+<h3>8.2 为什么冻结 Vision Encoder？</h3>
+<ul>
+<li><strong>梯度冲突风险</strong>：检测损失关注局部边缘，语言损失关注全局语义，同时反向传播会互相干扰。</li>
+<li>方案：先冻结 Encoder，只训检测头和投影层</li>
+<li>可选：阶段 4 用 LoRA 轻微适配，但需监控检测精度（⚡ 修订：阶段 4 已删）</li>
+<li>备选：如果 Qwen-VL 自带 ViT，可直接复用其已对齐的特征</li>
+</ul>
+<h3>8.3 为什么两路适配器分离？</h3>
+<table>
+<thead>
+<tr>
+<th>分支</th>
+<th>需要适配器</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>检测头</td>
+<td>2D 空间结构、多尺度：reshape + Neck + 位置编码</td>
+</tr>
+<tr>
+<td>语言塔</td>
+<td>序列 token、语义嵌入：MLP / Q-Former 投影</td>
+</tr>
+</tbody>
+</table>
+<p>两者需求不同，不能共用一路适配。</p>
+<h3>8.4 为什么语言塔必须接收 FEN + 引擎信息？</h3>
+<ul>
+<li><strong>没有 FEN</strong>：模型不知道当前局面，只能泛泛而谈。</li>
+<li><strong>没有引擎信息</strong>：模型不知道这步棋为什么好，无法解释。</li>
+<li><strong>只有视觉 token</strong>：模型看到画面但缺乏精确局面表示，容易"瞎说"。</li>
+</ul>
+<p>三者缺一不可：FEN 给局面，引擎给分析，视觉 token 给场景上下文。</p>
+<h3>8.5 视觉 token 的真正价值</h3>
+<p>当 FEN 和引擎信息已经提供精确局面时，视觉 token 补充的是：</p>
+<table>
+<thead>
+<tr>
+<th>视觉提供</th>
+<th>对评论的影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>棋盘朝向、红黑方视角</td>
+<td>判断"谁在走"</td>
+</tr>
+<tr>
+<td>棋子被手遮挡的模糊状态</td>
+<td>判断"是否在摆棋"</td>
+</tr>
+<tr>
+<td>对局阶段视觉线索</td>
+<td>调整评论语气</td>
+</tr>
+<tr>
+<td>用户手势、表情</td>
+<td>判断用户意图</td>
+</tr>
+<tr>
+<td>棋盘外环境（比赛/教学/直播）</td>
+<td>调整解说风格</td>
+</tr>
+</tbody>
+</table>
+<p>视觉不是替代 FEN，而是让评论"有场景感、有语气、有交互性"。</p>
+<blockquote>
+<p>⚡ 修订注：正因如此，视觉 token（阶段 2）的投入应<strong>后置于 B0 验证</strong>（见 §5.1 修订）。</p>
+</blockquote>
+<hr />
+<h2>9. ⚡ 与手机项目方案 A 的关系（评审新增）</h2>
+<p>手机项目（<code>chinese_chess_coach_phone_version</code>）的<strong>方案 A：PC 强模型自动标注（RF-DETR）</strong>与本方案阶段 1 是同一件事的两个视角——<strong>检测能力 + 数据引擎必须共用，不能做两套</strong>：</p>
+<pre><code>方案 A（手机项目维护）= 数据引擎（RF-DETR 自动标注 → v10 数据集）+ 端侧蒸馏（YOLOv8n-pose）
+本方案 阶段 1 = 直接消费 v10 数据集训练检测分支（以 RF-DETR 为起点做共享基座扩展）
+</code></pre>
+<ul>
+<li>v10 数据集是两个项目的公共资产（角点 GT 约定已对齐 BoardGeometry，见 §3.2.4 注）</li>
+<li>A 的 M1' spike（RF-DETR 棋盘标注）先行——它同时是本方案检测分支的可行性验证</li>
+<li>本方案的独有增量只在<strong>语言分支</strong>（投影层 + Qwen 塔语料/训练）与<strong>渲染层</strong></li>
+</ul>
+<h2>10. ⚡ 事实一致性自动闸（评审新增）</h2>
+<p>防幻觉从「原则」落为「可测指标」：LLM 输出中出现的每个<strong>着法、评分、局面断言</strong>，必须能对齐到引擎结构化输出：</p>
+<ul>
+<li>着法 ∈ {best_move} ∪ PV ∪ 合法着法表（经 Pikafish 校验）</li>
+<li>评分表述与 score 同号且量级一致（"略优/大优"分档）</li>
+<li>局面描述（子力、谁在走）与 FEN 解析结果一致</li>
+</ul>
+<p>实现为一个独立校验器（规则即可，无需模型），用于：</p>
+<ol>
+<li>训练语料自动过滤（GPT-4 生成的评论先过闸再入训练集）</li>
+<li>推理时输出后校验，不通过的句子降级为模板兜底</li>
+<li>讲解质量的自动评测指标（事实一致率）</li>
+</ol>
+<h2>11. ⚡ 修订后落地顺序（评审新增）</h2>
+<table>
+<thead>
+<tr>
+<th>步</th>
+<th>内容</th>
+<th>依赖</th>
+<th>项目</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A-M1'</td>
+<td>RF-DETR 棋盘标注 spike（vs SAM 管线）</td>
+<td>无</td>
+<td>手机项目</td>
+</tr>
+<tr>
+<td>A-M2</td>
+<td>v10 数据集（全量自动标注 + 校验闸）</td>
+<td>A-M1'</td>
+<td>手机项目</td>
+</tr>
+<tr>
+<td><strong>B0</strong></td>
+<td>FEN+引擎 → Qwen 纯文本讲解（Pikafish 批跑 + §5.3 语料）</td>
+<td>无，<strong>可立即并行</strong></td>
+<td>本项目</td>
+</tr>
+<tr>
+<td>B1</td>
+<td>PC 完整链路：检测 → FEN → 引擎 → 讲解 → 渲染</td>
+<td>A-M2 + B0</td>
+<td>本项目</td>
+</tr>
+<tr>
+<td>B2</td>
+<td>投影层/视觉 token</td>
+<td>仅当 B0/B1 证明场景语气值得</td>
+<td>本项目</td>
+</tr>
+<tr>
+<td>事实闸</td>
+<td>§10 校验器（随 B0 语料构建同步做）</td>
+<td>无</td>
+<td>本项目</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><em>核心原则：引擎算，模型说；检测做眼睛，语言做教练。</em></p>
+<p class="footer">象棋视频识别与走子建议系统（PC 版） · 文档格式：HTML（项目约定）</p>
+</body>
+</html>

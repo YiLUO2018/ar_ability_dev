@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>开发日志</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+           max-width: 960px; margin: 24px auto; padding: 0 20px;
+           color: #1f2937; line-height: 1.7; background: #fafafa; }
+    h1 { border-bottom: 3px solid #7c3aed; padding-bottom: 8px; color: #4c1d95; }
+    h2 { border-left: 5px solid #7c3aed; padding-left: 10px; margin-top: 2em; }
+    h3 { color: #6d28d9; margin-top: 1.6em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; background: #fff; }
+    th, td { border: 1px solid #d1d5db; padding: 6px 10px; text-align: left; }
+    th { background: #ede9fe; }
+    tr:nth-child(even) { background: #f9fafb; }
+    code { background: #eef2ff; padding: 1px 5px; border-radius: 3px;
+           font-family: Consolas, monospace; font-size: 0.92em; }
+    pre { background: #1e1e2e; color: #cdd6f4; padding: 14px; border-radius: 8px;
+          overflow-x: auto; }
+    pre code { background: none; color: inherit; padding: 0; }
+    blockquote { border-left: 4px solid #f59e0b; background: #fffbeb;
+                 margin: 1em 0; padding: 8px 14px; }
+    blockquote p { margin: 0.4em 0; }
+    a { color: #7c3aed; }
+    .footer { color: #9ca3af; font-size: 0.85em; text-align: center;
+              margin-top: 48px; border-top: 1px solid #e5e7eb; padding-top: 12px; }
+    .mermaid { background: #fff; padding: 12px; border-radius: 8px;
+               border: 1px solid #e5e7eb; text-align: center; }
+  </style>
+
+</head>
+<body>
+<h1>象棋视频识别与走子建议系统（PC 版） — 开发日志</h1>
+<blockquote>
+<p>按时间倒序记录开发过程、关键决策、遇到的问题与解决方案。</p>
+</blockquote>
+<hr />
+<h2>2026-10-16：建项，方案归档（含评审修订）</h2>
+<ul>
+<li><strong>建项背景</strong>：真机验证（手机项目）实证 SAM+规则级联上限低 → 方向决策分出两支：方案 A（RF-DETR 自动标注，留在手机项目维护）、
+  方案 B（本项目的共享视觉基座 + 检测头 + Pikafish + Qwen 语言塔）。<strong>本方案定位为电脑端程序</strong>（RTX 4060 8GB），与手机 App 为姊妹项目。</li>
+<li><strong>方案归档</strong>：原《vlm方案.html》（用户起草）转录为 <code>01-现行设计/VLM架构方案.md</code>，四项核心原则经评审确认——
+  引擎算模型说 / FEN+引擎+视觉三路输入锚定事实 / 分阶段训练显存可控 / 显式探针全链可视。</li>
+<li><strong>评审修订（已并入方案 §5/§8/§9-§11）</strong>：</li>
+<li>检测分支直接以 RF-DETR 为起点（它就是「DINOv2+DETR 头」的成熟实现），不自建两套；</li>
+<li>插入 <strong>B0</strong>（FEN+引擎→Qwen 纯文本讲解，零视觉成本先行验证讲解质量），阶段 2 投影层后置；</li>
+<li>删除阶段 4 联合微调（梯度冲突风险/收益低）；</li>
+<li>新增<strong>事实一致性自动闸</strong>（着法/评分/局面断言对齐引擎输出——防幻觉可测化，兼作语料过滤与质量评测）；</li>
+<li>语料工程升级为独立工作包；角点/网格约定对齐手机项目 BoardGeometry 保证 v10 跨项目通用。</li>
+<li><strong>下一步</strong>：B0（Pikafish 批跑 + 评论语料构建 + 事实闸校验器）可立即启动，与手机项目 A-M1' 并行。</li>
+</ul>
+<p class="footer">象棋视频识别与走子建议系统（PC 版） · 文档格式：HTML（项目约定）</p>
+</body>
+</html>

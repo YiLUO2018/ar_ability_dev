@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>象棋视频识别与走子建议系统（PC 版）— 项目主页</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+           max-width: 960px; margin: 24px auto; padding: 0 20px;
+           color: #1f2937; line-height: 1.7; background: #fafafa; }
+    h1 { border-bottom: 3px solid #7c3aed; padding-bottom: 8px; color: #4c1d95; }
+    h2 { border-left: 5px solid #7c3aed; padding-left: 10px; margin-top: 2em; }
+    h3 { color: #6d28d9; margin-top: 1.6em; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; background: #fff; }
+    th, td { border: 1px solid #d1d5db; padding: 6px 10px; text-align: left; }
+    th { background: #ede9fe; }
+    tr:nth-child(even) { background: #f9fafb; }
+    code { background: #eef2ff; padding: 1px 5px; border-radius: 3px;
+           font-family: Consolas, monospace; font-size: 0.92em; }
+    pre { background: #1e1e2e; color: #cdd6f4; padding: 14px; border-radius: 8px;
+          overflow-x: auto; }
+    pre code { background: none; color: inherit; padding: 0; }
+    blockquote { border-left: 4px solid #f59e0b; background: #fffbeb;
+                 margin: 1em 0; padding: 8px 14px; }
+    blockquote p { margin: 0.4em 0; }
+    a { color: #7c3aed; }
+    .footer { color: #9ca3af; font-size: 0.85em; text-align: center;
+              margin-top: 48px; border-top: 1px solid #e5e7eb; padding-top: 12px; }
+    .mermaid { background: #fff; padding: 12px; border-radius: 8px;
+               border: 1px solid #e5e7eb; text-align: center; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({startOnLoad:true, theme:'neutral'});</script>
+</head>
+<body>
+<h1>象棋视频识别与走子建议系统（PC 版，chinese_chess_coach_pc_version）</h1>
+<blockquote>
+<p>建项：2026-10-16 ｜ 状态：<strong>设计阶段（方案定稿待实施）</strong>
+姊妹项目：<code>apps/chinese_chess_coach_phone_version</code>（手机 AR 教练 App）——本项目的检测数据引擎（v10 数据集）由其「方案 A：PC 强模型自动标注（RF-DETR）」供给，跨项目复用。</p>
+</blockquote>
+<h2>定位</h2>
+<p><strong>电脑端程序</strong>（RTX 4060 8GB）：输入象棋视频/图像 → 棋盘角点与棋子检测 → FEN 局面重建 → Pikafish 引擎分析 → Qwen 语言塔生成讲解/评论 → 全链路可视化渲染输出。</p>
+<p>核心原则：<strong>引擎算，模型说；检测做眼睛，语言做教练。</strong></p>
+<ul>
+<li>不让 VLM 下棋（象棋搜索空间 10^40+，Pikafish 每秒搜索数百万节点，模型无法匹敌且无法自我验证）</li>
+<li>局面事实永远来自结构化输出（FEN + 引擎分析），视觉 token 只负责场景语气——防幻觉是架构纪律</li>
+<li>共享视觉编码器：图像一次编码，检测分支（高频）与语言分支（低频按需）复用</li>
+</ul>
+<h2>架构一览</h2>
+<pre><code>图像 → 共享视觉编码器（DINOv2 系，冻结）
+         ├─ 检测分支：角点头(4kpt) + 棋子头(DETR, 14类) → 透视/网格映射 → FEN
+         │                                                        ↓
+         │                                              Pikafish（走法/评分/PV）
+         └─ 语言分支：投影层 → 视觉 token ──────────┐
+                                                    ↓
+                          Qwen 2B/4B（FEN+引擎+视觉+用户问题 → 讲解/评论）
+                                                    ↓
+                          可视化渲染（角点框/棋盘面板/走法箭头/评分条/评论气泡）
+</code></pre>
+<h2>目录</h2>
+<pre><code>docs/
+  00-现状/     开发日志（进度与决策记录）
+  01-现行设计/ VLM架构方案（含 2026-10-16 评审修订）——主方案文档
+  03-探索与调研/
+  04-环境/     （WSL GPU / Pikafish / Qwen 环境记录，实施时补）
+</code></pre>
+<h2>当前待办（按优先级）</h2>
+<ol>
+<li><strong>B0</strong>：FEN+引擎信息 → Qwen 纯文本讲解（Pikafish 批跑 + 评论语料构建）——零视觉成本，先行验证讲解质量</li>
+<li>依赖手机项目方案 A 交付 v10 数据集（A-M1' spike：RF-DETR 棋盘标注）</li>
+<li>B1：PC 完整链路（检测→FEN→引擎→讲解→渲染）</li>
+<li>B2（条件启动）：投影层/视觉 token（仅当 B0/B1 证明场景语气值得）</li>
+</ol>
+<p class="footer">象棋视频识别与走子建议系统（PC 版） · 文档格式：HTML（项目约定）</p>
+</body>
+</html>
